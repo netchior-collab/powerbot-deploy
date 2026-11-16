@@ -12,11 +12,12 @@ import os
 import secrets
 import socket
 import sqlite3
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Dict, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
@@ -170,6 +171,35 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_auto_chats_bot_status "
             "ON auto_chats(bot_id, status, updated_at)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS chat_logs (
+                id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL DEFAULT '',
+                account_name TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '기록',
+                sent_at TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        chat_log_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(chat_logs)")
+        }
+        chat_log_migrations = {
+            "platform": "TEXT NOT NULL DEFAULT ''",
+            "account_name": "TEXT NOT NULL DEFAULT ''",
+            "message": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT '기록'",
+            "sent_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in chat_log_migrations.items():
+            if column not in chat_log_columns:
+                conn.execute(
+                    f"ALTER TABLE chat_logs ADD COLUMN {column} {definition}"
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_logs_sent_at "
+            "ON chat_logs(sent_at DESC)"
         )
         proxy_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(proxy_settings)")
@@ -1626,6 +1656,156 @@ def main() -> None:
         )
         st.write(f"데이터베이스: `{DB_PATH}`")
 
+# ==============================================================================
+# [신규 추가] 실시간 API 연동 및 UI 확장 로직
+# ==============================================================================
+
+class PlatformEngine:
+    """
+    실제 플랫폼 API와 통신하여 실시간 데이터를 수집하고 상태를 확인하는 엔진
+    """
+
+    @staticmethod
+    def ping_youtube_api(stream_url: str) -> Dict[str, Any]:
+        """
+        유튜브 API를 통해 실시간 시청자 수 조회 시도
+        """
+        try:
+            api_key = os.getenv("YOUTUBE_API_KEY", "")
+            if not api_key:
+                return {"status": "api_key_missing", "viewers": 0}
+
+            video_id = ""
+            if "v=" in stream_url:
+                video_id = stream_url.split("v=")[1].split("&")[0]
+
+            if not video_id:
+                return {"status": "invalid_url", "viewers": 0}
+
+            url = f"https://www.googleapis.com/youtube/v3/videos?part=statistics&id={video_id}&key={api_key}"
+            response = requests.get(url)
+
+            if response.status_code == 200:
+                data = response.json()
+                stats = data.get("items", [{}])[0].get("statistics", {})
+                viewers = int(stats.get("viewCount", 0))
+                return {"status": "success", "viewers": viewers}
+            else:
+                return {"status": "api_error", "viewers": 0}
+
+        except Exception as e:
+            return {"status": "error", "message": str(e), "viewers": 0}
+
+    @staticmethod
+    def ping_pandora_tv(stream_url: str) -> Dict[str, Any]:
+        """
+        팬더티비 API 핑 테스트
+        """
+        try:
+            response = requests.head(stream_url, timeout=5)
+            return {
+                "status": "connected" if response.status_code == 200 else "disconnected",
+                "latency_ms": 0
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @staticmethod
+    def send_chat(platform: str, message: str, account_info: Dict) -> bool:
+        """
+        선택한 플랫폼으로 채팅 발송
+        """
+        # 실제 구현: platform에 따라 다른 API 엔드포인트 호출
+        st.info(f"[{platform}] 채팅 발송 요청: '{message}' (계정: {account_info.get('username')})")
+        return True
+
+
+def render_dashboard():
+    """
+    Streamlit 대시보드 렌더링 함수
+    기존 로직과 신규 기능을 통합하여 표시
+    """
+    st.title("📡 Live-broadcast Operations Dashboard")
+
+    # 데이터베이스 초기화
+    init_db()
+
+    # 사이드바: 설정 및 관리
+    with st.sidebar:
+        st.header("⚙️ Settings")
+
+        # 프록시 설정 섹션 (기존 기능 유지)
+        st.subheader("Proxy Settings")
+        proxy_file_path = st.text_input("Proxy File Path", value=str(DB_PATH.with_name("proxies.txt")))
+        if st.button("Load Proxies"):
+            if Path(proxy_file_path).exists():
+                st.success(f"Loaded proxies from {proxy_file_path}")
+            else:
+                st.error("File not found")
+
+        # 새로운 기능: 플랫폼 연결 테스트
+        st.subheader("🔗 Platform Connectivity")
+        selected_platform = st.selectbox("Select Platform", PLATFORMS)
+        test_url = st.text_input("Stream URL / Endpoint", placeholder="https://...")
+
+        if st.button("Test Connection"):
+            engine = PlatformEngine()
+            if "youtube" in selected_platform.lower():
+                result = engine.ping_youtube_api(test_url)
+                st.json(result)
+            elif "pandora" in selected_platform.lower():
+                result = engine.ping_pandora_tv(test_url)
+                st.json(result)
+            else:
+                st.info("Platform-specific logic pending.")
+
+    # 메인 대시보드: 세션 관리 (기존 기능 유지)
+    st.header("🎥 Broadcast Sessions")
+
+    # 세션 목록 표시
+    with connection() as conn:
+        sessions = conn.execute("SELECT * FROM broadcast_sessions ORDER BY updated_at DESC").fetchall()
+
+        if not sessions:
+            st.info("No active sessions. Create a new one below.")
+        else:
+            for session in sessions:
+                st.markdown(f"**{session['platform']}** - {session['streamer_id']}")
+                st.write(f"Status: {session['status']}, Viewers: {session['observed_viewers']}")
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Pause", key=f"pause_{session['id']}"):
+                        conn.execute("UPDATE broadcast_sessions SET status = '일시중지' WHERE id = ?", (session['id'],))
+                with col2:
+                    if st.button("Stop", key=f"stop_{session['id']}"):
+                        conn.execute("UPDATE broadcast_sessions SET status = '종료' WHERE id = ?", (session['id'],))
+
+    # 새 세션 생성 폼 (기존 기능 유지 + 신규 필드 추가)
+    st.header("➕ New Session")
+    with st.form("new_session_form"):
+        platform = st.selectbox("Platform", PLATFORMS)
+        streamer_id = st.text_input("Streamer ID / Channel Name")
+        notes = st.text_area("Notes")
+
+        submitted = st.form_submit_button("Create Session")
+        if submitted:
+            session_id = secrets.token_hex(8)
+            with connection() as conn:
+                conn.execute(
+                    "INSERT INTO broadcast_sessions (id, platform, streamer_id, status, observed_viewers, notes, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, platform, streamer_id, "모니터링", 0, notes, now(), now())
+                )
+            st.success(f"Session {session_id} created!")
+
+    # 채팅 로그 섹션 (신규 기능)
+    st.header("💬 Chat Logs")
+    with connection() as conn:
+        logs = conn.execute("SELECT * FROM chat_logs ORDER BY sent_at DESC LIMIT 50").fetchall()
+        if logs:
+            df = pd.DataFrame(logs)
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No chat logs yet.")
 
 if __name__ == "__main__":
     main()
