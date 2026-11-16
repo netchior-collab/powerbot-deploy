@@ -1,0 +1,35 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+.pytest-tmp/
+.pycache-*/
+.audit-pycache/
+venv/
+.venv/
+install/
+pandas/
+streamlit/
+venvcall/
+
+# Test scratch directories and local databases
+test-temp/
+test-run-*/
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Local deployment state and secrets
+.wrangler/
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

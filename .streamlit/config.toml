@@ -1,0 +1,13 @@
+[server]
+address = "0.0.0.0"
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+maxUploadSize = 20
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#4F8BF9"
