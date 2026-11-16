@@ -19,7 +19,14 @@ from urllib.parse import urlsplit, urlunsplit
 import pandas as pd
 import streamlit as st
 
-PLATFORMS = ["팬더티비", "플렉스티비", "팝콘티비", "유튜브 라이브", "기타 방송"]
+PLATFORMS = [
+    "팬더티비",
+    "플렉스티비",
+    "팝콘티비",
+    "유튜브 라이브",
+    "제휴 P2P 미러링 사이트",
+    "기타 방송",
+]
 STATUSES = ["모니터링", "일시중지", "종료"]
 CONTROL_STATUSES = ["실행", "일시중지", "종료"]
 VIEWER_PLAN_STATUSES = ["대기", "일시중지", "종료"]
@@ -749,7 +756,7 @@ def login() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="방송 운영 대시보드", layout="wide")
+    st.set_page_config(page_title="라이브 방송 통합 오케스트레이터", layout="wide")
     login()
     database_identity = os.getenv("TURSO_DATABASE_URL", "").strip() or str(
         DB_PATH.resolve()
@@ -758,14 +765,14 @@ def main() -> None:
     expire_viewer_plans()
     refresh_viewer_plan_progress()
     title_column, session_column = st.columns([5, 1])
-    title_column.title("라이브 방송 운영 대시보드")
+    title_column.title("라이브 방송 통합 오케스트레이터")
     if session_column.button("로그아웃", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.pop("authenticated_at", None)
         st.rerun()
     st.caption(
-        "중앙 제어 화면에서 대상과 수량을 바로 등록하고, 나머지 설정은 필요한 탭에서 관리합니다. "
-        "현재 버전은 작업을 안전하게 기록·관리하며 외부 플랫폼 트래픽은 직접 생성하지 않습니다."
+        "중앙 제어, 화이트리스트, 플랫폼 계정·프록시, 채팅 문구를 원본 흐름대로 관리합니다. "
+        "현재 버전은 실행 계획과 상태를 기록하며 외부 플랫폼 트래픽은 직접 생성하지 않습니다."
     )
 
     snapshot = dashboard_snapshot()
@@ -792,7 +799,12 @@ def main() -> None:
     c4.metric("계획 시청자 합계", planned_viewers)
 
     viewer_tab, broadcast_tab, connection_tab, chat_settings_tab = st.tabs(
-        ["중앙 제어", "방송 관리", "연동 설정", "채팅 설정"]
+        [
+            "봇 & 채팅 실시간 제어 센터",
+            "방송 화이트리스트 관리",
+            "플랫폼/P2P 연동 계정 설정",
+            "자동 매크로 챗 문구 셋업",
+        ]
     )
     monitor = broadcast_tab
     allowlist = broadcast_tab
@@ -801,7 +813,7 @@ def main() -> None:
     chat_tab = chat_settings_tab
     notes = chat_settings_tab
     with monitor:
-        st.subheader("방송 모니터링 세션 등록")
+        st.subheader("실시간 서버 및 채팅 동기화 모니터")
         with st.form("session_form"):
             platform = st.selectbox("플랫폼", PLATFORMS)
             streamer_id = st.text_input("방송 URL", key="monitor_broadcast_url").strip()
@@ -876,7 +888,7 @@ def main() -> None:
             st.dataframe(data, width="stretch", hide_index=True)
 
     with allowlist:
-        st.subheader("방송 화이트리스트")
+        st.subheader("화이트리스트 데이터베이스")
         streamer_id = st.text_input("방송 URL", key="allowlist_url").strip()
         if st.button("추가"):
             try:
@@ -985,7 +997,7 @@ def main() -> None:
             st.info("등록된 시청자 계획이 없습니다.")
 
     with proxy_tab:
-        st.subheader("프록시 설정")
+        st.subheader("플랫폼/P2P 프록시 설정")
         with st.form("proxy_form"):
             proxy_name = st.text_input("프록시 이름").strip()
             proxy_endpoint = st.text_input(
@@ -1032,7 +1044,7 @@ def main() -> None:
             st.info("등록된 프록시가 없습니다.")
 
     with bot_tab:
-        st.subheader("계정 및 봇 작업")
+        st.subheader("플랫폼/P2P 연동 계정 및 봇 작업")
         with st.form("account_form"):
             account_platform = st.selectbox("계정 플랫폼", PLATFORMS)
             account_name = st.text_input("계정 이름").strip()
@@ -1136,7 +1148,7 @@ def main() -> None:
                     st.rerun()
 
     with chat_tab:
-        st.subheader("채팅 계획")
+        st.subheader("자동 매크로 채팅 데이터베이스")
         running_bots = [row for row in active_bot_rows if row["status"] == "실행"]
         with st.form("chat_form"):
             chat_bot = st.selectbox(

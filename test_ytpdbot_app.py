@@ -413,7 +413,7 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
     app_test.text_input[0].input("test-password")
     app_test.button[0].click().run(timeout=10)
     assert not app_test.exception
-    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert app_test.title[0].value == "라이브 방송 통합 오케스트레이터"
     assert database.exists()
 
     next(
@@ -454,7 +454,7 @@ def test_streamlit_refreshes_active_session_timeout(tmp_path, monkeypatch):
     app_test.run(timeout=10)
 
     assert not app_test.exception
-    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert app_test.title[0].value == "라이브 방송 통합 오케스트레이터"
     assert app_test.session_state["authenticated_at"] > previous_activity
 
 
@@ -482,7 +482,7 @@ def test_streamlit_local_desktop_mode_starts_without_password(tmp_path, monkeypa
     app_test.run(timeout=10)
 
     assert not app_test.exception
-    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert app_test.title[0].value == "라이브 방송 통합 오케스트레이터"
     assert "관리자 비밀번호" not in [field.label for field in app_test.text_input]
     assert "목표 투입 인원수 설정" in [field.label for field in app_test.slider]
     assert "방송 URL" in [field.label for field in app_test.text_input]
@@ -495,10 +495,10 @@ def test_streamlit_local_desktop_mode_starts_without_password(tmp_path, monkeypa
     assert "자동 종료 타이머" in [field.label for field in app_test.selectbox]
     assert "시청자 묶음 이름" not in [item.label for item in app_test.text_input]
     assert [tab.label for tab in app_test.tabs] == [
-        "중앙 제어",
-        "방송 관리",
-        "연동 설정",
-        "채팅 설정",
+        "봇 & 채팅 실시간 제어 센터",
+        "방송 화이트리스트 관리",
+        "플랫폼/P2P 연동 계정 설정",
+        "자동 매크로 챗 문구 셋업",
     ]
 
     control_url = next(
@@ -817,7 +817,7 @@ def test_streamlit_accepts_six_character_admin_password(tmp_path, monkeypatch):
     app_test.button[0].click().run(timeout=10)
 
     assert not app_test.exception
-    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert app_test.title[0].value == "라이브 방송 통합 오케스트레이터"
 
 
 def test_streamlit_starts_bot_from_dashboard(tmp_path, monkeypatch):
