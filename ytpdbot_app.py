@@ -706,6 +706,10 @@ def login() -> None:
             st.session_state.authenticated_at = current_timestamp
             return
         if current_timestamp - float(authenticated_at) < SESSION_TIMEOUT_SECONDS:
+            # Keep an actively used dashboard session alive.  Without this,
+            # the absolute one-hour cutoff can discard the very form submit
+            # that crosses the deadline and send the operator back to login.
+            st.session_state.authenticated_at = current_timestamp
             return
         st.session_state.authenticated = False
         st.session_state.pop("authenticated_at", None)

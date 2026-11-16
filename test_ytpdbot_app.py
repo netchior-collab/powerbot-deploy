@@ -416,6 +416,12 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
     assert app_test.title[0].value == "라이브 방송 운영 대시보드"
     assert database.exists()
 
+    next(
+        button for button in app_test.button if button.label == "로그아웃"
+    ).click().run(timeout=10)
+    assert not app_test.exception
+    assert app_test.title[0].value == "방송 운영 대시보드 로그인"
+
 
 def test_streamlit_expires_stale_authenticated_session(tmp_path, monkeypatch):
     monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
@@ -429,6 +435,27 @@ def test_streamlit_expires_stale_authenticated_session(tmp_path, monkeypatch):
     assert not app_test.exception
     assert app_test.title[0].value == "방송 운영 대시보드 로그인"
     assert any("세션이 만료" in warning.value for warning in app_test.warning)
+
+
+def test_streamlit_refreshes_active_session_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
+    monkeypatch.setenv(
+        "YTPDBOT_DB_PATH", str(tmp_path / "active-session.sqlite3")
+    )
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+    previous_activity = (
+        app.datetime.now(app.timezone.utc).timestamp()
+        - app.SESSION_TIMEOUT_SECONDS
+        + 10
+    )
+    app_test.session_state["authenticated"] = True
+    app_test.session_state["authenticated_at"] = previous_activity
+
+    app_test.run(timeout=10)
+
+    assert not app_test.exception
+    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert app_test.session_state["authenticated_at"] > previous_activity
 
 
 def test_streamlit_locks_login_after_repeated_failures(tmp_path, monkeypatch):
@@ -493,6 +520,267 @@ def test_streamlit_local_desktop_mode_starts_without_password(tmp_path, monkeypa
         ).fetchone()
     assert plan == ("팬더티비", BROADCAST_URL, 100)
     assert allowed == (BROADCAST_URL,)
+
+
+def test_streamlit_viewer_plan_lifecycle_buttons(tmp_path, monkeypatch):
+    database = tmp_path / "viewer-plan-buttons.sqlite3"
+    monkeypatch.setenv("YTPDBOT_LOCAL_DESKTOP", "1")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+
+    app_test.run(timeout=10)
+    control_url = next(
+        field for field in app_test.text_input if field.key == "control_broadcast_url"
+    )
+    control_url.input(BROADCAST_URL)
+    next(
+        button for button in app_test.button if button.label == "가동 계획 시작"
+    ).click().run(timeout=10)
+
+    assert not app_test.exception
+    with sqlite3.connect(database) as connection:
+        plan_id, status = connection.execute(
+            "SELECT id, status FROM viewer_plans"
+        ).fetchone()
+    assert status == "대기"
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"pause_viewer_plan_{plan_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        status = connection.execute(
+            "SELECT status FROM viewer_plans WHERE id=?", (plan_id,)
+        ).fetchone()[0]
+    assert status == "일시중지"
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"resume_viewer_plan_{plan_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        status = connection.execute(
+            "SELECT status FROM viewer_plans WHERE id=?", (plan_id,)
+        ).fetchone()[0]
+    assert status == "대기"
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"stop_viewer_plan_{plan_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        status, current_count = connection.execute(
+            "SELECT status, current_count FROM viewer_plans WHERE id=?", (plan_id,)
+        ).fetchone()
+    assert status == "종료"
+    assert current_count == 0
+
+    next(
+        checkbox
+        for checkbox in app_test.checkbox
+        if checkbox.label == "종료된 계획 표시"
+    ).set_value(True).run(timeout=10)
+    assert any(
+        button.key == f"stop_viewer_plan_{plan_id}"
+        for button in app_test.button
+    ) is False
+    assert any(BROADCAST_URL in info.value for info in app_test.info) is False
+
+
+def test_streamlit_broadcast_management_buttons(tmp_path, monkeypatch):
+    database = tmp_path / "broadcast-management-buttons.sqlite3"
+    monkeypatch.setenv("YTPDBOT_LOCAL_DESKTOP", "1")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+
+    app_test.run(timeout=10)
+    next(
+        field for field in app_test.text_input if field.key == "control_broadcast_url"
+    ).input(BROADCAST_URL)
+    next(
+        button for button in app_test.button if button.label == "가동 계획 시작"
+    ).click().run(timeout=10)
+
+    next(
+        field for field in app_test.text_input if field.key == "monitor_broadcast_url"
+    ).input(BROADCAST_URL)
+    next(
+        field for field in app_test.number_input if field.label == "실제 관측 시청자 수"
+    ).set_value(37)
+    next(
+        button for button in app_test.button if button.label == "등록"
+    ).click().run(timeout=10)
+
+    assert not app_test.exception
+    with sqlite3.connect(database) as connection:
+        session_id, status, observed = connection.execute(
+            "SELECT id, status, observed_viewers FROM broadcast_sessions"
+        ).fetchone()
+    assert (status, observed) == ("모니터링", 37)
+
+    next(
+        field for field in app_test.selectbox if field.label == "상태"
+    ).select("종료")
+    next(
+        field for field in app_test.number_input if field.label == "관측 시청자 수"
+    ).set_value(41)
+    next(
+        button for button in app_test.button if button.label == "저장"
+    ).click().run(timeout=10)
+
+    with sqlite3.connect(database) as connection:
+        status, observed = connection.execute(
+            "SELECT status, observed_viewers FROM broadcast_sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+    assert (status, observed) == ("종료", 41)
+
+    extra_url = "https://live.example.com/channel/allowlist-button"
+    next(
+        field for field in app_test.text_input if field.key == "allowlist_url"
+    ).input(extra_url)
+    next(
+        button for button in app_test.button if button.label == "추가"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM whitelist WHERE streamer_id=?", (extra_url,)
+        ).fetchone()[0] == 1
+
+
+def test_streamlit_connection_bot_and_chat_buttons(tmp_path, monkeypatch):
+    database = tmp_path / "connection-bot-chat-buttons.sqlite3"
+    monkeypatch.setenv("YTPDBOT_LOCAL_DESKTOP", "1")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+
+    app_test.run(timeout=10)
+    next(
+        field for field in app_test.text_input if field.label == "프록시 이름"
+    ).input("검증 프록시")
+    next(
+        field for field in app_test.text_input if field.label == "프록시 주소"
+    ).input("http://127.0.0.1:8080")
+    next(
+        button for button in app_test.button if button.label == "프록시 저장"
+    ).click().run(timeout=10)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT endpoint, enabled FROM proxy_settings WHERE name='검증 프록시'"
+        ).fetchone() == ("http://127.0.0.1:8080", 1)
+
+    proxy_toggle = next(
+        button
+        for button in app_test.button
+        if button.key == "toggle_proxy_검증 프록시"
+    )
+    proxy_toggle.click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT enabled FROM proxy_settings WHERE name='검증 프록시'"
+        ).fetchone()[0] == 0
+    next(
+        button
+        for button in app_test.button
+        if button.key == "toggle_proxy_검증 프록시"
+    ).click().run(timeout=10)
+
+    next(
+        field for field in app_test.text_input if field.label == "계정 이름"
+    ).input("검증 계정")
+    next(
+        button for button in app_test.button if button.label == "계정 추가"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        account_id, enabled = connection.execute(
+            "SELECT id, enabled FROM accounts WHERE account_name='검증 계정'"
+        ).fetchone()
+    assert enabled == 1
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"toggle_account_{account_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT enabled FROM accounts WHERE id=?", (account_id,)
+        ).fetchone()[0] == 0
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"toggle_account_{account_id}"
+    ).click().run(timeout=10)
+
+    next(
+        field for field in app_test.text_input if field.label == "대상 방송 URL"
+    ).input(BROADCAST_URL)
+    next(
+        button for button in app_test.button if button.label == "봇 작업 등록"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        bot_id, status = connection.execute(
+            "SELECT id, status FROM active_bots"
+        ).fetchone()
+    assert status == "실행"
+
+    next(
+        field for field in app_test.text_area if field.label == "채팅 메시지"
+    ).input("버튼 회귀 검증 메시지")
+    next(
+        button for button in app_test.button if button.label == "채팅 계획 등록"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        chat_id, status = connection.execute(
+            "SELECT id, status FROM auto_chats"
+        ).fetchone()
+    assert status == "실행"
+
+    for action, expected in (("pause_chat", "일시중지"), ("resume_chat", "실행")):
+        next(
+            button
+            for button in app_test.button
+            if button.key == f"{action}_{chat_id}"
+        ).click().run(timeout=10)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT status FROM auto_chats WHERE id=?", (chat_id,)
+            ).fetchone()[0] == expected
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"stop_chat_{chat_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT status FROM auto_chats WHERE id=?", (chat_id,)
+        ).fetchone()[0] == "종료"
+
+    for action, expected in (("pause_bot", "일시중지"), ("resume_bot", "실행")):
+        next(
+            button
+            for button in app_test.button
+            if button.key == f"{action}_{bot_id}"
+        ).click().run(timeout=10)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT status FROM active_bots WHERE id=?", (bot_id,)
+            ).fetchone()[0] == expected
+
+    next(
+        button
+        for button in app_test.button
+        if button.key == f"stop_bot_{bot_id}"
+    ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT status FROM active_bots WHERE id=?", (bot_id,)
+        ).fetchone()[0] == "종료"
 
 
 def test_windows_one_click_launcher_is_loopback_only_and_uses_e_drive_data():
