@@ -44,6 +44,9 @@ MAX_IDENTIFIER_LENGTH = 100
 MAX_BROADCAST_URL_LENGTH = 2048
 MAX_CHAT_MESSAGE_LENGTH = 500
 MIN_ADMIN_PASSWORD_LENGTH = 12
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 60
+SESSION_TIMEOUT_SECONDS = 60 * 60
 
 
 def now() -> str:
@@ -204,12 +207,22 @@ def whitelist() -> list[str]:
 
 
 def sessions() -> pd.DataFrame:
+    columns = [
+        "id",
+        "platform",
+        "streamer_id",
+        "status",
+        "observed_viewers",
+        "notes",
+        "started_at",
+        "updated_at",
+    ]
     with connection() as conn:
-        return pd.read_sql_query(
+        rows = conn.execute(
             "SELECT id, platform, streamer_id, status, observed_viewers, notes, "
             "started_at, updated_at FROM broadcast_sessions ORDER BY updated_at DESC",
-            conn,
-        )
+        ).fetchall()
+    return pd.DataFrame([dict(row) for row in rows], columns=columns)
 
 
 def records(table: str) -> list[sqlite3.Row]:
@@ -635,15 +648,48 @@ def login() -> None:
             "설정해야 합니다."
         )
         st.stop()
+    current_timestamp = datetime.now(timezone.utc).timestamp()
     if st.session_state.get("authenticated", False):
-        return
+        authenticated_at = st.session_state.get("authenticated_at")
+        if authenticated_at is None:
+            st.session_state.authenticated_at = current_timestamp
+            return
+        if current_timestamp - float(authenticated_at) < SESSION_TIMEOUT_SECONDS:
+            return
+        st.session_state.authenticated = False
+        st.session_state.pop("authenticated_at", None)
+        st.warning("보안을 위해 로그인 세션이 만료되었습니다. 다시 로그인하세요.")
+
     st.title("방송 운영 대시보드 로그인")
+    locked_until = float(st.session_state.get("login_locked_until", 0.0))
+    if current_timestamp < locked_until:
+        remaining = max(1, int(locked_until - current_timestamp) + 1)
+        st.error(f"로그인 시도가 잠겼습니다. {remaining}초 후 다시 시도하세요.")
+        st.stop()
     password = st.text_input("관리자 비밀번호", type="password")
     if st.button("로그인", type="primary"):
         if hmac.compare_digest(password, configured):
             st.session_state.authenticated = True
+            st.session_state.authenticated_at = current_timestamp
+            st.session_state.login_failed_attempts = 0
+            st.session_state.pop("login_locked_until", None)
             st.rerun()
-        st.error("비밀번호가 일치하지 않습니다.")
+        failed_attempts = int(st.session_state.get("login_failed_attempts", 0)) + 1
+        if failed_attempts >= MAX_LOGIN_ATTEMPTS:
+            st.session_state.login_failed_attempts = 0
+            st.session_state.login_locked_until = (
+                current_timestamp + LOGIN_LOCKOUT_SECONDS
+            )
+            st.error(
+                f"비밀번호를 {MAX_LOGIN_ATTEMPTS}회 잘못 입력해 "
+                f"{LOGIN_LOCKOUT_SECONDS}초 동안 로그인을 잠급니다."
+            )
+        else:
+            st.session_state.login_failed_attempts = failed_attempts
+            st.error(
+                "비밀번호가 일치하지 않습니다. "
+                f"남은 시도: {MAX_LOGIN_ATTEMPTS - failed_attempts}회"
+            )
     st.stop()
 
 
@@ -657,6 +703,7 @@ def main() -> None:
     title_column.title("라이브 방송 운영 대시보드")
     if session_column.button("로그아웃", use_container_width=True):
         st.session_state.authenticated = False
+        st.session_state.pop("authenticated_at", None)
         st.rerun()
     st.caption(
         "중앙 제어 화면에서 대상과 수량을 바로 등록하고, 나머지 설정은 필요한 탭에서 관리합니다. "
@@ -834,13 +881,19 @@ def main() -> None:
                 st.rerun()
 
         viewer_plan_rows = records("viewer_plans")
-        if viewer_plan_rows:
+        show_completed_plans = st.checkbox("종료된 계획 표시", value=False)
+        visible_viewer_plans = [
+            plan
+            for plan in viewer_plan_rows
+            if show_completed_plans or plan["status"] != "종료"
+        ]
+        if visible_viewer_plans:
             st.dataframe(
-                pd.DataFrame([dict(row) for row in viewer_plan_rows]),
+                pd.DataFrame([dict(row) for row in visible_viewer_plans]),
                 width="stretch",
                 hide_index=True,
             )
-            for plan in viewer_plan_rows:
+            for plan in visible_viewer_plans:
                 with st.expander(
                     f"{plan['streamer_id']} · {plan['viewer_count']}명 · {plan['status']}"
                 ):
@@ -864,6 +917,8 @@ def main() -> None:
                     ):
                         set_viewer_plan_status(plan["id"], "종료")
                         st.rerun()
+        elif viewer_plan_rows:
+            st.info("활성 계획이 없습니다. 종료된 계획 표시는 위 선택란에서 켤 수 있습니다.")
         else:
             st.info("등록된 시청자 계획이 없습니다.")
 

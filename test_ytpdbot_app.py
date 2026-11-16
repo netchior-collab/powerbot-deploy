@@ -411,6 +411,34 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
     assert app_test.title[0].value == "라이브 방송 운영 대시보드"
 
 
+def test_streamlit_expires_stale_authenticated_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(tmp_path / "expired-session.sqlite3"))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+    app_test.session_state["authenticated"] = True
+    app_test.session_state["authenticated_at"] = 0.0
+
+    app_test.run(timeout=10)
+
+    assert not app_test.exception
+    assert app_test.title[0].value == "방송 운영 대시보드 로그인"
+    assert any("세션이 만료" in warning.value for warning in app_test.warning)
+
+
+def test_streamlit_locks_login_after_repeated_failures(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(tmp_path / "login-lock.sqlite3"))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+    app_test.run(timeout=10)
+
+    for _ in range(app.MAX_LOGIN_ATTEMPTS):
+        app_test.text_input[0].input("wrong-password")
+        app_test.button[0].click().run(timeout=10)
+
+    assert not app_test.exception
+    assert any("로그인을 잠급니다" in error.value for error in app_test.error)
+
+
 def test_streamlit_local_desktop_mode_starts_without_password(tmp_path, monkeypatch):
     database = tmp_path / "local-desktop.sqlite3"
     monkeypatch.delenv("YTPDBOT_ADMIN_PASSWORD", raising=False)
