@@ -12,6 +12,7 @@ import os
 import secrets
 import socket
 import sqlite3
+import urllib.request
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -50,8 +51,38 @@ CHAT_MODES = [
 ]
 DURATION_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5"}
+PUBLIC_PROXY_SOURCES = [
+    (
+        "http",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+    ),
+    (
+        "socks5",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    ),
+    (
+        "http",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
+        "proxies/protocols/http/data.txt",
+    ),
+    (
+        "socks5",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
+        "proxies/protocols/socks5/data.txt",
+    ),
+    (
+        "http",
+        "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/http.txt",
+    ),
+    (
+        "socks5",
+        "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/socks5.txt",
+    ),
+]
 MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
+MAX_PUBLIC_PROXY_COLLECT = 20000
+MAX_PUBLIC_PROXY_WORKERS = 250
 DB_PATH = Path(os.getenv("YTPDBOT_DB_PATH", str(Path(__file__).with_name("broadcast_ops.db")))).expanduser()
 MAX_IDENTIFIER_LENGTH = 100
 MAX_BROADCAST_URL_LENGTH = 2048
@@ -625,6 +656,118 @@ def check_proxy_inventory_health(
                         (checked_at, bot["id"]),
                     )
     return {name: healthy for name, healthy, _ in results}
+
+
+def collect_and_verify_proxies(
+    max_collect: int = MAX_PUBLIC_PROXY_COLLECT,
+    workers: int = MAX_PUBLIC_PROXY_WORKERS,
+    *,
+    fetch_timeout_seconds: float = 12.0,
+    probe_timeout_seconds: float = 1.5,
+) -> dict[str, int]:
+    """Collect public proxy lists, TCP-check them, and save new live endpoints."""
+    if not 1 <= int(max_collect) <= MAX_PUBLIC_PROXY_COLLECT:
+        raise ValueError(
+            f"최대 수집 후보는 1~{MAX_PUBLIC_PROXY_COLLECT}개여야 합니다."
+        )
+    if not 1 <= int(workers) <= MAX_PUBLIC_PROXY_WORKERS:
+        raise ValueError(f"동시 점검 수는 1~{MAX_PUBLIC_PROXY_WORKERS}개여야 합니다.")
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    source_failures = 0
+    for default_scheme, source_url in PUBLIC_PROXY_SOURCES:
+        if len(candidates) >= max_collect:
+            break
+        try:
+            request = urllib.request.Request(
+                source_url,
+                headers={"User-Agent": "YN-Powerbot/1.0"},
+            )
+            with urllib.request.urlopen(
+                request, timeout=fetch_timeout_seconds
+            ) as response:
+                payload = response.read(MAX_PROXY_IMPORT_BYTES + 1)
+            if len(payload) > MAX_PROXY_IMPORT_BYTES:
+                source_failures += 1
+                continue
+            lines = payload.decode("utf-8", errors="ignore").splitlines()
+        except (OSError, ValueError):
+            source_failures += 1
+            continue
+
+        for raw_line in lines:
+            candidate = raw_line.strip().lstrip("\ufeff")
+            if not candidate or candidate.startswith("#"):
+                continue
+            if "://" not in candidate:
+                candidate = f"{default_scheme}://{candidate}"
+            try:
+                endpoint = normalize_proxy_endpoint(candidate)
+            except ValueError:
+                continue
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            candidates.append(endpoint)
+            if len(candidates) >= max_collect:
+                break
+
+    def probe(endpoint: str) -> tuple[str, bool]:
+        try:
+            check_proxy_connection(endpoint, probe_timeout_seconds)
+        except (OSError, ValueError):
+            return endpoint, False
+        return endpoint, True
+
+    if not candidates:
+        return {
+            "collected": 0,
+            "alive": 0,
+            "saved": 0,
+            "source_failures": source_failures,
+        }
+
+    worker_count = min(int(workers), len(candidates))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(probe, candidates))
+    alive_endpoints = [endpoint for endpoint, healthy in results if healthy]
+
+    saved_count = 0
+    if alive_endpoints:
+        timestamp = now()
+        with connection() as conn:
+            known = {
+                row["endpoint"]
+                for row in conn.execute(
+                    "SELECT endpoint FROM proxy_settings"
+                ).fetchall()
+            }
+            for endpoint in alive_endpoints:
+                if endpoint in known:
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO proxy_settings "
+                    "(name, endpoint, enabled, updated_at, source, last_checked_at, "
+                    "health_status, quarantined, failure_reason) "
+                    "VALUES (?, ?, 1, ?, '자동 수집', ?, '정상', 0, '')",
+                    (
+                        _proxy_inventory_name(endpoint),
+                        endpoint,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                if getattr(cursor, "rowcount", 1) != 0:
+                    known.add(endpoint)
+                    saved_count += 1
+
+    return {
+        "collected": len(candidates),
+        "alive": len(alive_endpoints),
+        "saved": saved_count,
+        "source_failures": source_failures,
+    }
 
 
 def check_proxy_health(name: str, timeout_seconds: float = 3.0) -> bool:
@@ -1357,6 +1500,28 @@ def main() -> None:
     with proxy_tab:
         st.subheader("플랫폼/P2P 프록시 인벤토리")
         st.caption("http/https/socks4/socks5 엔드포인트를 관리합니다.")
+        if st.button(
+            "공개 프록시 전체 자동 수집·검증",
+            key="collect_public_proxies",
+            use_container_width=True,
+        ):
+            with st.spinner("공개 목록을 수집하고 연결 상태를 확인하는 중입니다..."):
+                try:
+                    collection_result = collect_and_verify_proxies()
+                except (OSError, RuntimeError, ValueError) as exc:
+                    st.error(f"자동 수집에 실패했습니다: {exc}")
+                else:
+                    st.success(
+                        f"자동 수집 완료: 후보 {collection_result['collected']}개, "
+                        f"정상 {collection_result['alive']}개, "
+                        f"신규 저장 {collection_result['saved']}개"
+                    )
+                    if collection_result["source_failures"]:
+                        st.warning(
+                            f"응답하지 않은 목록 {collection_result['source_failures']}개는 "
+                            "건너뛰었습니다."
+                        )
+                    st.rerun()
         with st.form("proxy_form"):
             proxy_name = st.text_input("프록시 이름").strip()
             proxy_endpoint = st.text_input(

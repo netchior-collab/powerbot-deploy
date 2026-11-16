@@ -196,6 +196,67 @@ def test_proxy_inventory_import_tracks_source_and_existing_duplicates(
     ]
 
 
+def test_public_proxy_collection_fetches_checks_and_saves_live_endpoints(
+    isolated_database, monkeypatch
+):
+    payloads = {
+        "https://lists.example/http.txt": (
+            b"one.example:8080\ninvalid\nuser:secret@hidden.example:80\n"
+        ),
+        "https://lists.example/socks5.txt": (
+            b"socks5://two.example:1080\nhttp://one.example:8080\n"
+        ),
+    }
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            return self.payload if size < 0 else self.payload[:size]
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        return FakeResponse(payloads[request.full_url])
+
+    def fake_check(endpoint, timeout_seconds):
+        del timeout_seconds
+        if endpoint == "socks5://two.example:1080":
+            raise ConnectionRefusedError("offline")
+
+    monkeypatch.setattr(
+        app,
+        "PUBLIC_PROXY_SOURCES",
+        [
+            ("http", "https://lists.example/http.txt"),
+            ("socks5", "https://lists.example/socks5.txt"),
+        ],
+    )
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(app, "check_proxy_connection", fake_check)
+
+    result = app.collect_and_verify_proxies(max_collect=10, workers=4)
+
+    assert result == {
+        "collected": 2,
+        "alive": 1,
+        "saved": 1,
+        "source_failures": 0,
+    }
+    with sqlite3.connect(isolated_database) as connection:
+        row = connection.execute(
+            "SELECT endpoint, source, health_status, quarantined "
+            "FROM proxy_settings"
+        ).fetchone()
+    assert row == ("http://one.example:8080", "자동 수집", "정상", 0)
+
+
 def test_proxy_health_failure_quarantines_and_success_allows_reactivation(
     isolated_database, monkeypatch
 ):
@@ -659,6 +720,14 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
     assert not app_test.exception
     assert app_test.title[0].value == "라이브 방송 통합 오케스트레이터"
     assert database.exists()
+    assert any(
+        button.label == "공개 프록시 전체 자동 수집·검증"
+        for button in app_test.button
+    )
+    rendered_captions = " ".join(caption.value for caption in app_test.caption)
+    assert "외부 플랫폼 트래픽은 직접 생성하지 않습니다" not in rendered_captions
+    assert "상태 점검은 TCP 도달성만" not in rendered_captions
+    assert "인증정보가 포함된 주소는 저장하지 않습니다" not in rendered_captions
 
     next(
         button for button in app_test.button if button.label == "로그아웃"
