@@ -253,15 +253,13 @@ def test_public_proxy_collection_fetches_checks_and_saves_live_endpoints(
     }
     with sqlite3.connect(isolated_database) as connection:
         row = connection.execute(
-            "SELECT endpoint, source, health_status, quarantined "
+            "SELECT endpoint, source, enabled, health_status, quarantined "
             "FROM proxy_settings"
         ).fetchone()
-    assert row == ("http://one.example:8080", "자동 수집", "정상", 0)
+    assert row == ("http://one.example:8080", "자동 수집", 0, "정상", 0)
 
 
-def test_proxy_health_failure_quarantines_and_success_allows_reactivation(
-    isolated_database, monkeypatch
-):
+def test_proxy_health_failure_discards_proxy(isolated_database, monkeypatch):
     assert app.save_proxy("점검 대상", "http://127.0.0.1:8080", source="직접 등록")
 
     def fail_connection(endpoint, timeout_seconds=3.0):
@@ -271,25 +269,9 @@ def test_proxy_health_failure_quarantines_and_success_allows_reactivation(
     assert app.check_proxy_health("점검 대상") is False
     with sqlite3.connect(isolated_database) as connection:
         failed = connection.execute(
-            "SELECT enabled, health_status, quarantined, failure_reason, "
-            "last_checked_at FROM proxy_settings WHERE name='점검 대상'"
+            "SELECT 1 FROM proxy_settings WHERE name='점검 대상'"
         ).fetchone()
-    assert failed[:4] == (0, "실패", 1, "연결 실패 (ConnectionRefusedError)")
-    assert failed[4]
-    with pytest.raises(ValueError, match="격리"):
-        app.set_proxy_enabled("점검 대상", True)
-
-    monkeypatch.setattr(
-        app, "check_proxy_connection", lambda endpoint, timeout_seconds=3.0: None
-    )
-    assert app.check_proxy_health("점검 대상") is True
-    app.set_proxy_enabled("점검 대상", True)
-    with sqlite3.connect(isolated_database) as connection:
-        recovered = connection.execute(
-            "SELECT enabled, health_status, quarantined, failure_reason "
-            "FROM proxy_settings WHERE name='점검 대상'"
-        ).fetchone()
-    assert recovered == (1, "정상", 0, "")
+    assert failed is None
 
 
 def test_verify_proxy_route_sends_request_through_proxy_and_activates(
@@ -339,7 +321,7 @@ def test_verify_proxy_route_sends_request_through_proxy_and_activates(
     assert stored == (1, "정상", 0, "203.0.113.7", 125)
 
 
-def test_verify_proxy_route_failure_disables_and_quarantines(
+def test_verify_proxy_route_failure_discards_proxy(
     isolated_database, monkeypatch
 ):
     app.save_proxy("실패 경유", "socks5://proxy.example:1080", source="테스트")
@@ -350,15 +332,79 @@ def test_verify_proxy_route_failure_disables_and_quarantines(
 
     monkeypatch.setattr(app.requests, "get", fail_get)
 
-    with pytest.raises(ValueError, match="실제 프록시 경유 요청에 실패"):
+    with pytest.raises(ValueError, match="폐기"):
         app.verify_proxy_route("실패 경유")
 
     with sqlite3.connect(isolated_database) as connection:
         stored = connection.execute(
-            "SELECT enabled, health_status, quarantined, failure_reason, "
-            "last_exit_ip, latency_ms FROM proxy_settings WHERE name='실패 경유'"
+            "SELECT 1 FROM proxy_settings WHERE name='실패 경유'"
         ).fetchone()
-    assert stored == (0, "실패", 1, "실제 경유 실패 (ProxyError)", "", 0)
+    assert stored is None
+
+
+def test_proxy_failover_discards_failure_and_reassigns_running_work(
+    isolated_database, monkeypatch
+):
+    timestamp = app.now()
+    app.save_proxy("실패 후보", "http://bad.example:8080", source="테스트")
+    app.save_proxy("정상 후보", "http://good.example:8080", source="테스트")
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bot",
+                "플랫폼",
+                "streamer",
+                "account",
+                "실패 후보",
+                "실행",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO auto_chats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("chat", "bot", "message", 30, "실행", timestamp, timestamp),
+        )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ip": "203.0.113.21"}
+
+    def fake_get(url, **kwargs):
+        del url
+        if kwargs["proxies"]["https"] == "http://bad.example:8080":
+            raise app.requests.exceptions.ProxyError("unreachable")
+        return FakeResponse()
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    result = app.activate_proxy_with_failover(
+        "실패 후보", timeout_seconds=1, max_candidates=2, workers=2
+    )
+
+    assert result["name"] == "정상 후보"
+    assert result["discarded"] == ["실패 후보"]
+    assert result["reassigned_bots"] == 1
+    with app.connection() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM proxy_settings WHERE name='실패 후보'"
+        ).fetchone() is None
+        winner = connection.execute(
+            "SELECT enabled, health_status, last_exit_ip "
+            "FROM proxy_settings WHERE name='정상 후보'"
+        ).fetchone()
+        bot = connection.execute(
+            "SELECT proxy_name, status FROM active_bots WHERE id='bot'"
+        ).fetchone()
+        chat_status = connection.execute(
+            "SELECT status FROM auto_chats WHERE id='chat'"
+        ).fetchone()[0]
+    assert tuple(winner) == (1, "정상", "203.0.113.21")
+    assert tuple(bot) == ("정상 후보", "실행")
+    assert chat_status == "실행"
 
 
 def test_proxy_connection_check_uses_endpoint_tcp_reachability():
@@ -408,7 +454,7 @@ def test_failed_proxy_pauses_dependent_bot_and_chat(isolated_database, monkeypat
         chat_status = connection.execute(
             "SELECT status FROM auto_chats WHERE id='chat'"
         ).fetchone()[0]
-    assert tuple(proxy) == (0, 1, "실패")
+    assert proxy is None
     assert bot_status == "일시중지"
     assert chat_status == "일시중지"
 

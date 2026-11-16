@@ -85,6 +85,8 @@ MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
 MAX_PUBLIC_PROXY_COLLECT = 20000
 MAX_PUBLIC_PROXY_WORKERS = 250
+MAX_PROXY_FAILOVER_CANDIDATES = 40
+MAX_PROXY_FAILOVER_WORKERS = 10
 PROXY_EGRESS_CHECK_URL = "https://api.ipify.org?format=json"
 DB_PATH = Path(os.getenv("YTPDBOT_DB_PATH", str(Path(__file__).with_name("broadcast_ops.db")))).expanduser()
 MAX_IDENTIFIER_LENGTH = 100
@@ -573,7 +575,7 @@ def import_proxy_inventory(raw_text: str, source: str) -> dict[str, Any]:
                 "INSERT OR IGNORE INTO proxy_settings "
                 "(name, endpoint, enabled, updated_at, source, last_checked_at, "
                 "health_status, quarantined, failure_reason) "
-                "VALUES (?, ?, 1, ?, ?, '', '미점검', 0, '')",
+                "VALUES (?, ?, 0, ?, ?, '', '미점검', 0, '')",
                 (_proxy_inventory_name(endpoint), endpoint, timestamp, normalized_source),
             )
             if getattr(cursor, "rowcount", 1) == 0:
@@ -599,11 +601,51 @@ def check_proxy_connection(endpoint: str, timeout_seconds: float = 3.0) -> None:
         pass
 
 
+def _probe_proxy_route(endpoint: str, timeout_seconds: float) -> dict[str, Any]:
+    endpoint = normalize_proxy_endpoint(endpoint)
+    started_at = time.perf_counter()
+    response = requests.get(
+        PROXY_EGRESS_CHECK_URL,
+        proxies={"http": endpoint, "https": endpoint},
+        timeout=timeout_seconds,
+        headers={"User-Agent": "YN-Powerbot/1.0"},
+    )
+    response.raise_for_status()
+    exit_ip = str(ipaddress.ip_address(response.json()["ip"]))
+    latency_ms = max(1, int((time.perf_counter() - started_at) * 1000))
+    return {"endpoint": endpoint, "exit_ip": exit_ip, "latency_ms": latency_ms}
+
+
+def _discard_failed_proxy(name: str, *, pause_dependents: bool) -> list[str]:
+    timestamp = now()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        affected_bots = conn.execute(
+            "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
+            (name,),
+        ).fetchall()
+        bot_ids = [bot["id"] for bot in affected_bots]
+        conn.execute("DELETE FROM proxy_settings WHERE name=?", (name,))
+        if pause_dependents:
+            for bot_id in bot_ids:
+                conn.execute(
+                    "UPDATE active_bots SET status='일시중지', updated_at=? "
+                    "WHERE id=?",
+                    (timestamp, bot_id),
+                )
+                conn.execute(
+                    "UPDATE auto_chats SET status='일시중지', updated_at=? "
+                    "WHERE bot_id=? AND status='실행'",
+                    (timestamp, bot_id),
+                )
+    return bot_ids
+
+
 def verify_proxy_route(
     name: str,
     timeout_seconds: float = 10.0,
 ) -> dict[str, Any]:
-    """Send one harmless diagnostic request through a proxy and activate it."""
+    """Verify one proxy, deleting it immediately when actual routing fails."""
     with connection() as conn:
         proxy = conn.execute(
             "SELECT endpoint FROM proxy_settings WHERE name=?", (name,)
@@ -611,64 +653,130 @@ def verify_proxy_route(
     if proxy is None:
         raise ValueError("확인할 프록시를 찾을 수 없습니다.")
 
-    endpoint = normalize_proxy_endpoint(proxy["endpoint"])
-    started_at = time.perf_counter()
     try:
-        response = requests.get(
-            PROXY_EGRESS_CHECK_URL,
-            proxies={"http": endpoint, "https": endpoint},
-            timeout=timeout_seconds,
-            headers={"User-Agent": "YN-Powerbot/1.0"},
-        )
-        response.raise_for_status()
-        exit_ip = str(ipaddress.ip_address(response.json()["ip"]))
-    except (
-        requests.RequestException,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        checked_at = now()
-        reason = f"실제 경유 실패 ({type(exc).__name__})"
-        with connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "UPDATE proxy_settings SET enabled=0, health_status='실패', "
-                "quarantined=1, failure_reason=?, last_checked_at=?, "
-                "last_exit_ip='', latency_ms=0, updated_at=? WHERE name=?",
-                (reason, checked_at, checked_at, name),
-            )
-            affected_bots = conn.execute(
-                "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
-                (name,),
-            ).fetchall()
-            for bot in affected_bots:
-                conn.execute(
-                    "UPDATE active_bots SET status='일시중지', updated_at=? "
-                    "WHERE id=?",
-                    (checked_at, bot["id"]),
-                )
-                conn.execute(
-                    "UPDATE auto_chats SET status='일시중지', updated_at=? "
-                    "WHERE bot_id=? AND status='실행'",
-                    (checked_at, bot["id"]),
-                )
-        raise ValueError("실제 프록시 경유 요청에 실패했습니다.") from None
+        result = _probe_proxy_route(proxy["endpoint"], timeout_seconds)
+    except (requests.RequestException, KeyError, TypeError, ValueError):
+        _discard_failed_proxy(name, pause_dependents=True)
+        raise ValueError("실패한 프록시를 폐기했습니다.") from None
 
-    latency_ms = max(1, int((time.perf_counter() - started_at) * 1000))
     checked_at = now()
     with connection() as conn:
         conn.execute(
             "UPDATE proxy_settings SET enabled=1, health_status='정상', "
             "quarantined=0, failure_reason='', last_checked_at=?, "
             "last_exit_ip=?, latency_ms=?, updated_at=? WHERE name=?",
-            (checked_at, exit_ip, latency_ms, checked_at, name),
+            (
+                checked_at,
+                result["exit_ip"],
+                result["latency_ms"],
+                checked_at,
+                name,
+            ),
         )
+    return {"name": name, **result}
+
+
+def activate_proxy_with_failover(
+    preferred_name: str,
+    timeout_seconds: float = 8.0,
+    max_candidates: int = MAX_PROXY_FAILOVER_CANDIDATES,
+    workers: int = MAX_PROXY_FAILOVER_WORKERS,
+) -> dict[str, Any]:
+    """Discard failed candidates and immediately switch dependents to a winner."""
+    if max_candidates < 1 or workers < 1:
+        raise ValueError("자동 전환 후보와 동시 점검 수는 1개 이상이어야 합니다.")
+    with connection() as conn:
+        candidates = conn.execute(
+            "SELECT name, endpoint FROM proxy_settings "
+            "ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, enabled DESC, "
+            "CASE health_status WHEN '정상' THEN 0 WHEN '미점검' THEN 1 ELSE 2 END, "
+            "updated_at DESC LIMIT ?",
+            (preferred_name, int(max_candidates)),
+        ).fetchall()
+    if not candidates:
+        raise ValueError("자동 전환할 프록시가 없습니다.")
+
+    discarded: list[str] = []
+    affected_bot_ids: set[str] = set()
+    winner: dict[str, Any] | None = None
+    attempted = 0
+    batch_size = min(int(workers), len(candidates))
+    for offset in range(0, len(candidates), batch_size):
+        batch = candidates[offset : offset + batch_size]
+
+        def probe(candidate: Any) -> tuple[Any, dict[str, Any] | None]:
+            try:
+                return candidate, _probe_proxy_route(
+                    candidate["endpoint"], timeout_seconds
+                )
+            except (requests.RequestException, KeyError, TypeError, ValueError):
+                return candidate, None
+
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            results = list(executor.map(probe, batch))
+        attempted += len(results)
+        successful = [
+            (candidate, result)
+            for candidate, result in results
+            if result is not None
+        ]
+        failed = [candidate for candidate, result in results if result is None]
+        for candidate in failed:
+            affected_bot_ids.update(
+                _discard_failed_proxy(
+                    candidate["name"], pause_dependents=False
+                )
+            )
+            discarded.append(candidate["name"])
+        if successful:
+            candidate, result = min(
+                successful, key=lambda item: item[1]["latency_ms"]
+            )
+            winner = {"name": candidate["name"], **result}
+            break
+
+    timestamp = now()
+    if winner is None:
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for bot_id in affected_bot_ids:
+                conn.execute(
+                    "UPDATE active_bots SET status='일시중지', updated_at=? "
+                    "WHERE id=?",
+                    (timestamp, bot_id),
+                )
+                conn.execute(
+                    "UPDATE auto_chats SET status='일시중지', updated_at=? "
+                    "WHERE bot_id=? AND status='실행'",
+                    (timestamp, bot_id),
+                )
+        raise ValueError("정상 동작하는 프록시가 없어 실패 후보를 모두 폐기했습니다.")
+
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE proxy_settings SET enabled=1, health_status='정상', "
+            "quarantined=0, failure_reason='', last_checked_at=?, "
+            "last_exit_ip=?, latency_ms=?, updated_at=? WHERE name=?",
+            (
+                timestamp,
+                winner["exit_ip"],
+                winner["latency_ms"],
+                timestamp,
+                winner["name"],
+            ),
+        )
+        for bot_id in affected_bot_ids:
+            conn.execute(
+                "UPDATE active_bots SET proxy_name=?, status='실행', updated_at=? "
+                "WHERE id=?",
+                (winner["name"], timestamp, bot_id),
+            )
     return {
-        "name": name,
-        "endpoint": endpoint,
-        "exit_ip": exit_ip,
-        "latency_ms": latency_ms,
+        **winner,
+        "attempted": attempted,
+        "discarded": discarded,
+        "reassigned_bots": len(affected_bot_ids),
     }
 
 
@@ -714,16 +822,11 @@ def check_proxy_inventory_health(
                     (checked_at, checked_at, name),
                 )
             else:
-                conn.execute(
-                    "UPDATE proxy_settings SET enabled=0, health_status='실패', "
-                    "quarantined=1, failure_reason=?, last_checked_at=?, "
-                    "last_exit_ip='', latency_ms=0, updated_at=? WHERE name=?",
-                    (reason, checked_at, checked_at, name),
-                )
                 affected_bots = conn.execute(
                     "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
                     (name,),
                 ).fetchall()
+                conn.execute("DELETE FROM proxy_settings WHERE name=?", (name,))
                 for bot in affected_bots:
                     conn.execute(
                         "UPDATE active_bots SET status='일시중지', updated_at=? "
@@ -830,7 +933,7 @@ def collect_and_verify_proxies(
                     "INSERT OR IGNORE INTO proxy_settings "
                     "(name, endpoint, enabled, updated_at, source, last_checked_at, "
                     "health_status, quarantined, failure_reason) "
-                    "VALUES (?, ?, 1, ?, '자동 수집', ?, '정상', 0, '')",
+                    "VALUES (?, ?, 0, ?, '자동 수집', ?, '정상', 0, '')",
                     (
                         _proxy_inventory_name(endpoint),
                         endpoint,
@@ -1591,11 +1694,31 @@ def main() -> None:
                 except (OSError, RuntimeError, ValueError) as exc:
                     st.error(f"자동 수집에 실패했습니다: {exc}")
                 else:
+                    failover_result = None
+                    if collection_result["alive"]:
+                        with connection() as conn:
+                            first_proxy = conn.execute(
+                                "SELECT name FROM proxy_settings "
+                                "ORDER BY enabled DESC, updated_at DESC LIMIT 1"
+                            ).fetchone()
+                        if first_proxy is not None:
+                            try:
+                                failover_result = activate_proxy_with_failover(
+                                    first_proxy["name"]
+                                )
+                            except ValueError as exc:
+                                st.warning(str(exc))
                     st.success(
                         f"자동 수집 완료: 후보 {collection_result['collected']}개, "
                         f"정상 {collection_result['alive']}개, "
                         f"신규 저장 {collection_result['saved']}개"
                     )
+                    if failover_result is not None:
+                        st.success(
+                            f"자동 연결: {failover_result['name']} · "
+                            f"{failover_result['latency_ms']}ms · "
+                            f"실패 폐기 {len(failover_result['discarded'])}개"
+                        )
                     if collection_result["source_failures"]:
                         st.warning(
                             f"응답하지 않은 목록 {collection_result['source_failures']}개는 "
@@ -1619,14 +1742,25 @@ def main() -> None:
                 saved = save_proxy(
                     proxy_name,
                     proxy_endpoint,
-                    enabled=proxy_enabled,
+                    enabled=False,
                     source=proxy_source,
                 )
             except ValueError as exc:
                 st.error(str(exc))
             else:
                 if saved:
-                    st.success("프록시 설정을 저장했습니다.")
+                    if proxy_enabled:
+                        try:
+                            route_result = activate_proxy_with_failover(proxy_name)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.success(
+                                f"저장·자동 연결 완료: {route_result['name']} · "
+                                f"{route_result['latency_ms']}ms"
+                            )
+                    else:
+                        st.success("프록시 설정을 비활성 상태로 저장했습니다.")
                 else:
                     st.info("같은 프록시 주소가 이미 있어 중복 등록하지 않았습니다.")
                 st.rerun()
@@ -1664,10 +1798,30 @@ def main() -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                failover_result = None
+                if result["imported"]:
+                    with connection() as conn:
+                        first_proxy = conn.execute(
+                            "SELECT name FROM proxy_settings "
+                            "ORDER BY enabled DESC, updated_at DESC LIMIT 1"
+                        ).fetchone()
+                    if first_proxy is not None:
+                        try:
+                            failover_result = activate_proxy_with_failover(
+                                first_proxy["name"]
+                            )
+                        except ValueError as exc:
+                            st.warning(str(exc))
                 st.success(
                     f"가져오기 완료: 신규 {result['imported']}개, "
                     f"중복 제외 {result['duplicates']}개, 형식 오류 {result['invalid']}개"
                 )
+                if failover_result is not None:
+                    st.success(
+                        f"자동 연결: {failover_result['name']} · "
+                        f"{failover_result['latency_ms']}ms · "
+                        f"실패 폐기 {len(failover_result['discarded'])}개"
+                    )
                 if result["errors"]:
                     st.warning("\n".join(result["errors"][:20]))
                 st.rerun()
@@ -1677,7 +1831,7 @@ def main() -> None:
                 passed = sum(health_results.values())
                 st.success(
                     f"연결 상태 점검 완료: 정상 {passed}개, "
-                    f"실패·격리 {len(proxies) - passed}개"
+                    f"실패·폐기 {len(proxies) - passed}개"
                 )
                 st.rerun()
             display_rows = [
@@ -1715,14 +1869,17 @@ def main() -> None:
                         key=f"route_proxy_{proxy['name']}",
                     ):
                         try:
-                            route_result = verify_proxy_route(proxy["name"])
+                            route_result = activate_proxy_with_failover(
+                                proxy["name"]
+                            )
                         except ValueError as exc:
                             st.error(str(exc))
                         else:
                             st.success(
-                                f"실제 프록시 경유 성공 · 출구 IP "
+                                f"자동 전환 완료 · {route_result['name']} · 출구 IP "
                                 f"{route_result['exit_ip']} · "
-                                f"{route_result['latency_ms']}ms"
+                                f"{route_result['latency_ms']}ms · "
+                                f"실패 폐기 {len(route_result['discarded'])}개"
                             )
                     next_enabled = not bool(proxy["enabled"])
                     action = (
@@ -1733,11 +1890,14 @@ def main() -> None:
                     if c2.button(action, key=f"toggle_proxy_{proxy['name']}"):
                         try:
                             if next_enabled:
-                                route_result = verify_proxy_route(proxy["name"])
+                                route_result = activate_proxy_with_failover(
+                                    proxy["name"]
+                                )
                                 st.success(
-                                    f"활성화 완료 · 출구 IP "
+                                    f"자동 전환 완료 · {route_result['name']} · 출구 IP "
                                     f"{route_result['exit_ip']} · "
-                                    f"{route_result['latency_ms']}ms"
+                                    f"{route_result['latency_ms']}ms · "
+                                    f"실패 폐기 {len(route_result['discarded'])}개"
                                 )
                             else:
                                 set_proxy_enabled(proxy["name"], False)
