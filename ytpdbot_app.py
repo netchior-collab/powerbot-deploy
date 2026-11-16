@@ -198,6 +198,13 @@ def init_db() -> None:
         )
 
 
+@st.cache_resource(show_spinner=False)
+def init_db_once(database_identity: str) -> None:
+    """Initialize one database once per Streamlit process instead of every rerun."""
+    del database_identity
+    init_db()
+
+
 def whitelist() -> list[str]:
     with connection() as conn:
         rows = conn.execute(
@@ -233,6 +240,50 @@ def records(table: str) -> list[sqlite3.Row]:
         raise ValueError(f"지원하지 않는 테이블: {table}")
     with connection() as conn:
         return conn.execute(f"SELECT * FROM {table} ORDER BY rowid DESC").fetchall()
+
+
+def dashboard_snapshot() -> dict[str, Any]:
+    """Load all read-only dashboard data through one remote DB connection."""
+    session_columns = [
+        "id",
+        "platform",
+        "streamer_id",
+        "status",
+        "observed_viewers",
+        "notes",
+        "started_at",
+        "updated_at",
+    ]
+    with connection() as conn:
+        session_rows = conn.execute(
+            "SELECT id, platform, streamer_id, status, observed_viewers, notes, "
+            "started_at, updated_at FROM broadcast_sessions ORDER BY updated_at DESC"
+        ).fetchall()
+        allowlist_rows = conn.execute(
+            "SELECT streamer_id FROM whitelist ORDER BY streamer_id"
+        ).fetchall()
+        table_rows = {
+            table: [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid DESC"
+                ).fetchall()
+            ]
+            for table in (
+                "proxy_settings",
+                "accounts",
+                "active_bots",
+                "auto_chats",
+                "viewer_plans",
+            )
+        }
+    return {
+        "sessions": pd.DataFrame(
+            [dict(row) for row in session_rows], columns=session_columns
+        ),
+        "whitelist": [row["streamer_id"] for row in allowlist_rows],
+        **table_rows,
+    }
 
 
 def normalized_identifier(value: str, label: str) -> str:
@@ -695,10 +746,13 @@ def login() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="방송 운영 대시보드", layout="wide")
-    init_db()
+    login()
+    database_identity = os.getenv("TURSO_DATABASE_URL", "").strip() or str(
+        DB_PATH.resolve()
+    )
+    init_db_once(database_identity)
     expire_viewer_plans()
     refresh_viewer_plan_progress()
-    login()
     title_column, session_column = st.columns([5, 1])
     title_column.title("라이브 방송 운영 대시보드")
     if session_column.button("로그아웃", use_container_width=True):
@@ -710,9 +764,15 @@ def main() -> None:
         "현재 버전은 작업을 안전하게 기록·관리하며 외부 플랫폼 트래픽은 직접 생성하지 않습니다."
     )
 
-    data = sessions()
+    snapshot = dashboard_snapshot()
+    data = snapshot["sessions"]
+    allowlist_items = snapshot["whitelist"]
+    viewer_plan_rows = snapshot["viewer_plans"]
+    proxies = snapshot["proxy_settings"]
+    account_rows = snapshot["accounts"]
+    active_bot_rows = snapshot["active_bots"]
+    chats = snapshot["auto_chats"]
     active = data[data["status"] != "종료"] if not data.empty else data
-    viewer_plan_rows = records("viewer_plans")
     planned_viewers = sum(
         int(row["viewer_count"])
         for row in viewer_plan_rows
@@ -724,7 +784,7 @@ def main() -> None:
         "관측 시청자 합계",
         int(active["observed_viewers"].sum()) if not active.empty else 0,
     )
-    c3.metric("화이트리스트", len(whitelist()))
+    c3.metric("화이트리스트", len(allowlist_items))
     c4.metric("계획 시청자 합계", planned_viewers)
 
     viewer_tab, broadcast_tab, connection_tab, chat_settings_tab = st.tabs(
@@ -752,7 +812,7 @@ def main() -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                if streamer_id not in whitelist():
+                if streamer_id not in allowlist_items:
                     st.error(
                         "화이트리스트에 등록된 방송 URL만 "
                         "모니터링할 수 있습니다."
@@ -776,7 +836,6 @@ def main() -> None:
                     st.success("모니터링 세션을 등록했습니다.")
                     st.rerun()
 
-        data = sessions()
         if data.empty:
             st.info("등록된 모니터링 세션이 없습니다.")
         else:
@@ -828,7 +887,7 @@ def main() -> None:
                     )
                 st.success("화이트리스트를 저장했습니다.")
                 st.rerun()
-        for item in whitelist():
+        for item in allowlist_items:
             st.write(f"• {item}")
 
     with viewer_tab:
@@ -880,7 +939,6 @@ def main() -> None:
                 st.success("방송 URL과 가동 계획을 시작했습니다.")
                 st.rerun()
 
-        viewer_plan_rows = records("viewer_plans")
         show_completed_plans = st.checkbox("종료된 계획 표시", value=False)
         visible_viewer_plans = [
             plan
@@ -950,7 +1008,6 @@ def main() -> None:
                     )
                 st.success("프록시 설정을 저장했습니다.")
                 st.rerun()
-        proxies = records("proxy_settings")
         if proxies:
             st.dataframe(
                 pd.DataFrame([dict(row) for row in proxies]),
@@ -992,7 +1049,6 @@ def main() -> None:
                 st.success("계정을 추가했습니다.")
                 st.rerun()
 
-        account_rows = records("accounts")
         if account_rows:
             st.dataframe(
                 pd.DataFrame([dict(row) for row in account_rows]),
@@ -1010,7 +1066,7 @@ def main() -> None:
                         )
                     st.rerun()
         enabled_accounts = [row for row in account_rows if row["enabled"]]
-        proxy_rows = [row for row in records("proxy_settings") if row["enabled"]]
+        proxy_rows = [row for row in proxies if row["enabled"]]
         bot_platform = st.selectbox("봇 플랫폼", PLATFORMS, key="bot_platform")
         platform_accounts = [
             row for row in enabled_accounts if row["platform"] == bot_platform
@@ -1052,7 +1108,7 @@ def main() -> None:
                     st.success("봇 작업을 실행 예정 상태로 등록했습니다.")
                     st.rerun()
 
-        for bot in records("active_bots"):
+        for bot in active_bot_rows:
             with st.expander(f"{bot['platform']} · {bot['streamer_id']} · {bot['status']}"):
                 c1, c2 = st.columns(2)
                 if bot["status"] == "실행" and c1.button(
@@ -1077,7 +1133,7 @@ def main() -> None:
 
     with chat_tab:
         st.subheader("채팅 계획")
-        running_bots = [row for row in records("active_bots") if row["status"] == "실행"]
+        running_bots = [row for row in active_bot_rows if row["status"] == "실행"]
         with st.form("chat_form"):
             chat_bot = st.selectbox(
                 "대상 봇",
@@ -1109,7 +1165,6 @@ def main() -> None:
                 else:
                     st.success("채팅 계획을 실행 예정 상태로 등록했습니다.")
                     st.rerun()
-        chats = records("auto_chats")
         if chats:
             st.dataframe(
                 pd.DataFrame([dict(row) for row in chats]),

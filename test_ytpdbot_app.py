@@ -400,18 +400,21 @@ def test_deploy_domain_pattern_rejects_invalid_or_injected_values(domain, valid)
 
 
 def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
+    database = tmp_path / "ui.sqlite3"
     monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
-    monkeypatch.setenv("YTPDBOT_DB_PATH", str(tmp_path / "ui.sqlite3"))
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
     app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
 
     app_test.run(timeout=10)
     assert not app_test.exception
     assert app_test.title[0].value == "방송 운영 대시보드 로그인"
+    assert not database.exists()
 
     app_test.text_input[0].input("test-password")
     app_test.button[0].click().run(timeout=10)
     assert not app_test.exception
     assert app_test.title[0].value == "라이브 방송 운영 대시보드"
+    assert database.exists()
 
 
 def test_streamlit_expires_stale_authenticated_session(tmp_path, monkeypatch):
