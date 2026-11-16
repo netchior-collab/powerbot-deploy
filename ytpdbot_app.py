@@ -564,6 +564,7 @@ def check_proxy_inventory_health(
         results = list(executor.map(probe, proxies))
     checked_at = now()
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         for name, healthy, reason in results:
             if healthy:
                 conn.execute(
@@ -578,6 +579,21 @@ def check_proxy_inventory_health(
                     "WHERE name=?",
                     (reason, checked_at, checked_at, name),
                 )
+                affected_bots = conn.execute(
+                    "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
+                    (name,),
+                ).fetchall()
+                for bot in affected_bots:
+                    conn.execute(
+                        "UPDATE active_bots SET status='일시중지', updated_at=? "
+                        "WHERE id=?",
+                        (checked_at, bot["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE auto_chats SET status='일시중지', updated_at=? "
+                        "WHERE bot_id=? AND status='실행'",
+                        (checked_at, bot["id"]),
+                    )
     return {name: healthy for name, healthy, _ in results}
 
 
@@ -586,7 +602,9 @@ def check_proxy_health(name: str, timeout_seconds: float = 3.0) -> bool:
 
 
 def set_proxy_enabled(name: str, enabled: bool) -> None:
+    timestamp = now()
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         proxy = conn.execute(
             "SELECT quarantined FROM proxy_settings WHERE name=?", (name,)
         ).fetchone()
@@ -596,8 +614,74 @@ def set_proxy_enabled(name: str, enabled: bool) -> None:
             raise ValueError("격리된 프록시는 연결 상태 점검을 통과한 뒤 활성화하세요.")
         conn.execute(
             "UPDATE proxy_settings SET enabled=?, updated_at=? WHERE name=?",
-            (int(enabled), now(), name),
+            (int(enabled), timestamp, name),
         )
+        if not enabled:
+            affected_bots = conn.execute(
+                "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
+                (name,),
+            ).fetchall()
+            for bot in affected_bots:
+                conn.execute(
+                    "UPDATE active_bots SET status='일시중지', updated_at=? WHERE id=?",
+                    (timestamp, bot["id"]),
+                )
+                conn.execute(
+                    "UPDATE auto_chats SET status='일시중지', updated_at=? "
+                    "WHERE bot_id=? AND status='실행'",
+                    (timestamp, bot["id"]),
+                )
+
+
+def save_account(platform: str, account_name: str) -> bool:
+    """Save one account record; return False when it already exists."""
+    if platform not in PLATFORMS:
+        raise ValueError("지원하지 않는 계정 플랫폼입니다.")
+    normalized_name = normalized_identifier(account_name, "계정 이름")
+    with connection() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM accounts WHERE platform=? AND account_name=?",
+            (platform, normalized_name),
+        ).fetchone()
+        if existing is not None:
+            return False
+        conn.execute(
+            "INSERT INTO accounts (id, platform, account_name, enabled, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (secrets.token_urlsafe(12), platform, normalized_name, now()),
+        )
+    return True
+
+
+def set_account_enabled(account_id: str, enabled: bool) -> None:
+    """Toggle an account and pause dependent work when it becomes unavailable."""
+    timestamp = now()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        account = conn.execute(
+            "SELECT platform, account_name FROM accounts WHERE id=?", (account_id,)
+        ).fetchone()
+        if account is None:
+            raise ValueError("계정을 찾을 수 없습니다.")
+        conn.execute(
+            "UPDATE accounts SET enabled=? WHERE id=?", (int(enabled), account_id)
+        )
+        if not enabled:
+            affected_bots = conn.execute(
+                "SELECT id FROM active_bots WHERE platform=? AND account_name=? "
+                "AND status='실행'",
+                (account["platform"], account["account_name"]),
+            ).fetchall()
+            for bot in affected_bots:
+                conn.execute(
+                    "UPDATE active_bots SET status='일시중지', updated_at=? WHERE id=?",
+                    (timestamp, bot["id"]),
+                )
+                conn.execute(
+                    "UPDATE auto_chats SET status='일시중지', updated_at=? "
+                    "WHERE bot_id=? AND status='실행'",
+                    (timestamp, bot["id"]),
+                )
 
 
 def set_bot_status(bot_id: str, status: str) -> None:
@@ -622,7 +706,8 @@ def set_bot_status(bot_id: str, status: str) -> None:
                 raise ValueError("사용 가능한 계정이 아니므로 봇을 다시 시작할 수 없습니다.")
             if bot["proxy_name"]:
                 proxy = conn.execute(
-                    "SELECT 1 FROM proxy_settings WHERE name=? AND enabled=1",
+                    "SELECT 1 FROM proxy_settings "
+                    "WHERE name=? AND enabled=1 AND quarantined=0",
                     (bot["proxy_name"],),
                 ).fetchone()
                 if proxy is None:
@@ -688,7 +773,8 @@ def start_bot(
             raise ValueError("선택한 플랫폼의 사용 가능한 계정을 찾을 수 없습니다.")
         if proxy_name:
             proxy = conn.execute(
-                "SELECT 1 FROM proxy_settings WHERE name=? AND enabled=1",
+                "SELECT 1 FROM proxy_settings "
+                "WHERE name=? AND enabled=1 AND quarantined=0",
                 (proxy_name,),
             ).fetchone()
             if proxy is None:
@@ -1375,18 +1461,14 @@ def main() -> None:
             add_account = st.form_submit_button("계정 추가")
         if add_account:
             try:
-                account_name = normalized_identifier(account_name, "계정 이름")
+                saved = save_account(account_platform, account_name)
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                with connection() as conn:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO accounts "
-                        "(id, platform, account_name, enabled, created_at) "
-                        "VALUES (?, ?, ?, 1, ?)",
-                        (secrets.token_urlsafe(12), account_platform, account_name, now()),
-                    )
-                st.success("계정을 추가했습니다.")
+                if saved:
+                    st.success("계정을 추가했습니다.")
+                else:
+                    st.info("같은 플랫폼과 계정 이름이 이미 있어 중복 등록하지 않았습니다.")
                 st.rerun()
 
         if account_rows:
@@ -1399,11 +1481,7 @@ def main() -> None:
                 next_enabled = 0 if account["enabled"] else 1
                 action = "계정 중지" if account["enabled"] else "계정 활성화"
                 if st.button(action, key=f"toggle_account_{account['id']}"):
-                    with connection() as conn:
-                        conn.execute(
-                            "UPDATE accounts SET enabled=? WHERE id=?",
-                            (next_enabled, account["id"]),
-                        )
+                    set_account_enabled(account["id"], bool(next_enabled))
                     st.rerun()
         enabled_accounts = [row for row in account_rows if row["enabled"]]
         proxy_rows = [

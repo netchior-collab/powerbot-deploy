@@ -243,6 +243,86 @@ def test_proxy_connection_check_uses_endpoint_tcp_reachability():
         app.check_proxy_connection(f"http://127.0.0.1:{port}", 0.2)
 
 
+def test_failed_proxy_pauses_dependent_bot_and_chat(isolated_database, monkeypatch):
+    timestamp = app.now()
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO proxy_settings (name, endpoint, enabled, updated_at) "
+            "VALUES (?, ?, 1, ?)",
+            ("proxy", "http://127.0.0.1:8080", timestamp),
+        )
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bot", "플랫폼", "streamer", "account", "proxy", "실행", timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO auto_chats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("chat", "bot", "message", 30, "실행", timestamp, timestamp),
+        )
+
+    def fail_connection(endpoint, timeout_seconds=3.0):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(app, "check_proxy_connection", fail_connection)
+    assert app.check_proxy_health("proxy") is False
+    with app.connection() as connection:
+        proxy = connection.execute(
+            "SELECT enabled, quarantined, health_status FROM proxy_settings "
+            "WHERE name='proxy'"
+        ).fetchone()
+        bot_status = connection.execute(
+            "SELECT status FROM active_bots WHERE id='bot'"
+        ).fetchone()[0]
+        chat_status = connection.execute(
+            "SELECT status FROM auto_chats WHERE id='chat'"
+        ).fetchone()[0]
+    assert tuple(proxy) == (0, 1, "실패")
+    assert bot_status == "일시중지"
+    assert chat_status == "일시중지"
+
+
+def test_disabling_account_pauses_dependent_bot_and_chat(isolated_database):
+    timestamp = app.now()
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO accounts VALUES (?, ?, ?, 1, ?)",
+            ("account", "플랫폼", "계정", timestamp),
+        )
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bot", "플랫폼", "streamer", "계정", "", "실행", timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO auto_chats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("chat", "bot", "message", 30, "실행", timestamp, timestamp),
+        )
+    app.set_account_enabled("account", False)
+    with app.connection() as connection:
+        account_enabled = connection.execute(
+            "SELECT enabled FROM accounts WHERE id='account'"
+        ).fetchone()[0]
+        bot_status = connection.execute(
+            "SELECT status FROM active_bots WHERE id='bot'"
+        ).fetchone()[0]
+        chat_status = connection.execute(
+            "SELECT status FROM auto_chats WHERE id='chat'"
+        ).fetchone()[0]
+    assert account_enabled == 0
+    assert bot_status == "일시중지"
+    assert chat_status == "일시중지"
+
+
+def test_save_account_reports_duplicate_without_creating_another_row(isolated_database):
+    assert app.save_account("유튜브 라이브", "검증 계정") is True
+    assert app.save_account("유튜브 라이브", "검증 계정") is False
+    with app.connection() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM accounts WHERE platform=? AND account_name=?",
+            ("유튜브 라이브", "검증 계정"),
+        ).fetchone()[0]
+    assert count == 1
+
+
 def test_proxy_schema_migration_deduplicates_without_breaking_bot_reference(
     tmp_path, monkeypatch
 ):
