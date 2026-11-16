@@ -324,7 +324,7 @@ def test_gradual_viewer_plan_updates_local_progress(isolated_database):
     assert 0 < plan["current_count"] <= 100
 
 
-def test_viewer_plan_restores_original_1500_limit_and_equal_partner_quota(
+def test_viewer_plan_restores_original_1500_limit_and_owner_quota(
     isolated_database,
 ):
     with app.connection() as connection:
@@ -337,20 +337,23 @@ def test_viewer_plan_restores_original_1500_limit_and_equal_partner_quota(
         "기타 방송", BROADCAST_URL, "최댓값", 1500
     )
     assert maximum
+    with app.connection() as connection:
+        connection.execute("UPDATE viewer_plans SET status='종료'")
     app.add_viewer_plan(
-        "기타 방송", BROADCAST_URL, "Sewon 첫 계획", 1500, operator="Sewon"
+        "기타 방송", BROADCAST_URL, "사장님 첫 계획", 1500, operator="사장님(나)"
     )
     app.add_viewer_plan(
-        "기타 방송", BROADCAST_URL, "Sewon 추가 계획", 500, operator="Sewon"
+        "기타 방송", BROADCAST_URL, "사장님 추가 계획", 500, operator="사장님(나)"
     )
     with pytest.raises(ValueError, match="잔여 할당량"):
         app.add_viewer_plan(
-            "기타 방송", BROADCAST_URL, "Sewon 초과", 20, operator="Sewon"
+            "기타 방송", BROADCAST_URL, "사장님 초과", 20, operator="사장님(나)"
         )
 
     assert app.MIN_VIEWER_COUNT == 20
     assert app.MAX_VIEWER_COUNT == 1500
     assert app.VIEWER_COUNT_STEP == 10
+    assert list(app.PARTNER_LIMITS) == ["사장님(나)"]
     assert set(app.PARTNER_LIMITS.values()) == {2000}
 
 
@@ -510,7 +513,20 @@ def test_streamlit_rejects_short_admin_password(tmp_path, monkeypatch):
 
     app_test.run(timeout=10)
     assert not app_test.exception
-    assert "12자 이상" in app_test.error[0].value
+    assert "6자 이상" in app_test.error[0].value
+
+
+def test_streamlit_accepts_six_character_admin_password(tmp_path, monkeypatch):
+    monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "abc123")
+    monkeypatch.setenv("YTPDBOT_DB_PATH", str(tmp_path / "six-character-password.sqlite3"))
+    app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
+
+    app_test.run(timeout=10)
+    app_test.text_input[0].input("abc123")
+    app_test.button[0].click().run(timeout=10)
+
+    assert not app_test.exception
+    assert app_test.title[0].value == "라이브 방송 운영 대시보드"
 
 
 def test_streamlit_starts_bot_from_dashboard(tmp_path, monkeypatch):
