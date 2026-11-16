@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -36,6 +37,9 @@ def test_database_enables_wal_and_creates_required_tables(isolated_database):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
+        proxy_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(proxy_settings)")
+        }
     assert journal_mode == "wal"
     assert {
         "whitelist",
@@ -46,6 +50,13 @@ def test_database_enables_wal_and_creates_required_tables(isolated_database):
         "auto_chats",
         "viewer_plans",
     } <= tables
+    assert {
+        "source",
+        "last_checked_at",
+        "health_status",
+        "quarantined",
+        "failure_reason",
+    } <= proxy_columns
 
 
 def test_remote_database_requires_auth_token(monkeypatch):
@@ -127,6 +138,158 @@ def test_proxy_endpoint_normalization():
         app.normalize_proxy_endpoint("http://user:password@example.com:8080")
 
 
+def test_proxy_inventory_validates_formats_and_deduplicates():
+    endpoints, errors, duplicates = app.parse_proxy_inventory(
+        "\n".join(
+            [
+                "HTTP://Example.COM:8080",
+                "http://example.com:8080",
+                "https://secure.example:443",
+                "socks4://legacy.example:1080",
+                "socks5://modern.example:1080",
+                "ftp://invalid.example:21",
+                "http://user:secret@example.com:8080",
+            ]
+        )
+    )
+
+    assert endpoints == [
+        "http://example.com:8080",
+        "https://secure.example:443",
+        "socks4://legacy.example:1080",
+        "socks5://modern.example:1080",
+    ]
+    assert duplicates == 1
+    assert len(errors) == 2
+    assert all("secret" not in error for error in errors)
+
+
+def test_proxy_inventory_import_tracks_source_and_existing_duplicates(
+    isolated_database,
+):
+    first = app.import_proxy_inventory(
+        "http://one.example:8080\nsocks5://two.example:1080\ninvalid",
+        "공개 테스트 목록",
+    )
+    second = app.import_proxy_inventory(
+        "HTTP://ONE.EXAMPLE:8080\nhttps://three.example:443",
+        "업데이트 목록",
+    )
+
+    assert first == {
+        "imported": 2,
+        "duplicates": 0,
+        "invalid": 1,
+        "errors": ["3행: 프록시 형식은 http, https, socks4, socks5만 지원합니다."],
+    }
+    assert second["imported"] == 1
+    assert second["duplicates"] == 1
+    with sqlite3.connect(isolated_database) as connection:
+        rows = connection.execute(
+            "SELECT endpoint, source, health_status, quarantined "
+            "FROM proxy_settings ORDER BY endpoint"
+        ).fetchall()
+    assert rows == [
+        ("http://one.example:8080", "공개 테스트 목록", "미점검", 0),
+        ("https://three.example:443", "업데이트 목록", "미점검", 0),
+        ("socks5://two.example:1080", "공개 테스트 목록", "미점검", 0),
+    ]
+
+
+def test_proxy_health_failure_quarantines_and_success_allows_reactivation(
+    isolated_database, monkeypatch
+):
+    assert app.save_proxy("점검 대상", "http://127.0.0.1:8080", source="직접 등록")
+
+    def fail_connection(endpoint, timeout_seconds=3.0):
+        raise ConnectionRefusedError("private diagnostic must not be stored")
+
+    monkeypatch.setattr(app, "check_proxy_connection", fail_connection)
+    assert app.check_proxy_health("점검 대상") is False
+    with sqlite3.connect(isolated_database) as connection:
+        failed = connection.execute(
+            "SELECT enabled, health_status, quarantined, failure_reason, "
+            "last_checked_at FROM proxy_settings WHERE name='점검 대상'"
+        ).fetchone()
+    assert failed[:4] == (0, "실패", 1, "연결 실패 (ConnectionRefusedError)")
+    assert failed[4]
+    with pytest.raises(ValueError, match="격리"):
+        app.set_proxy_enabled("점검 대상", True)
+
+    monkeypatch.setattr(
+        app, "check_proxy_connection", lambda endpoint, timeout_seconds=3.0: None
+    )
+    assert app.check_proxy_health("점검 대상") is True
+    app.set_proxy_enabled("점검 대상", True)
+    with sqlite3.connect(isolated_database) as connection:
+        recovered = connection.execute(
+            "SELECT enabled, health_status, quarantined, failure_reason "
+            "FROM proxy_settings WHERE name='점검 대상'"
+        ).fetchone()
+    assert recovered == (1, "정상", 0, "")
+
+
+def test_proxy_connection_check_uses_endpoint_tcp_reachability():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        app.check_proxy_connection(f"socks5://127.0.0.1:{port}", 0.5)
+    finally:
+        listener.close()
+
+    with pytest.raises(OSError):
+        app.check_proxy_connection(f"http://127.0.0.1:{port}", 0.2)
+
+
+def test_proxy_schema_migration_deduplicates_without_breaking_bot_reference(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "old-proxy-schema.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE proxy_settings (name TEXT PRIMARY KEY, endpoint TEXT NOT NULL, "
+            "enabled INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE active_bots (id TEXT PRIMARY KEY, platform TEXT NOT NULL, "
+            "streamer_id TEXT NOT NULL, account_name TEXT NOT NULL, "
+            "proxy_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO proxy_settings VALUES (?, ?, 1, ?)",
+            [
+                ("기존 A", "http://duplicate.example:8080", app.now()),
+                ("기존 B", "http://duplicate.example:8080", app.now()),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bot", "플랫폼", "방송", "계정", "기존 B", "종료", app.now(), app.now()),
+        )
+
+    monkeypatch.setattr(app, "DB_PATH", database)
+    app.init_db()
+
+    with sqlite3.connect(database) as connection:
+        proxies = connection.execute(
+            "SELECT name, endpoint FROM proxy_settings"
+        ).fetchall()
+        bot_proxy = connection.execute(
+            "SELECT proxy_name FROM active_bots WHERE id='bot'"
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO proxy_settings (name, endpoint, enabled, updated_at) "
+                "VALUES ('다시 중복', 'http://duplicate.example:8080', 1, ?)",
+                (app.now(),),
+            )
+    assert proxies == [("기존 A", "http://duplicate.example:8080")]
+    assert bot_proxy == "기존 A"
+
+
 def test_broadcast_url_normalization_and_platform_detection():
     assert (
         app.normalize_broadcast_url(" HTTPS://YouTube.COM/live/abc#chat ")
@@ -169,7 +332,8 @@ def test_resuming_bot_rechecks_disabled_dependencies(
             ("account", "플랫폼", "계정", 1, timestamp),
         )
         connection.execute(
-            "INSERT INTO proxy_settings VALUES (?, ?, ?, ?)",
+            "INSERT INTO proxy_settings (name, endpoint, enabled, updated_at) "
+            "VALUES (?, ?, ?, ?)",
             ("proxy", "http://127.0.0.1:8080", 1, timestamp),
         )
     bot_id = app.start_bot("플랫폼", BROADCAST_URL, "account", "proxy")
@@ -493,6 +657,9 @@ def test_streamlit_local_desktop_mode_starts_without_password(tmp_path, monkeypa
     )
     assert "가동 계획 시작" in [button.label for button in app_test.button]
     assert "자동 종료 타이머" in [field.label for field in app_test.selectbox]
+    assert "프록시 일괄 붙여넣기" in [field.label for field in app_test.text_area]
+    assert "프록시 파일 가져오기" in [field.label for field in app_test.file_uploader]
+    assert "일괄 가져오기" in [button.label for button in app_test.button]
     assert "시청자 묶음 이름" not in [item.label for item in app_test.text_input]
     assert [tab.label for tab in app_test.tabs] == [
         "봇 & 채팅 실시간 제어 센터",

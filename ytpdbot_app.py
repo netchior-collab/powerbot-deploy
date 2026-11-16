@@ -6,10 +6,13 @@ control surface while preserving the existing monitoring dashboard.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 import secrets
+import socket
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +49,8 @@ CHAT_MODES = [
 ]
 DURATION_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5"}
+MAX_PROXY_IMPORT_LINES = 5000
+MAX_PROXY_IMPORT_BYTES = 1024 * 1024
 DB_PATH = Path(os.getenv("YTPDBOT_DB_PATH", str(Path(__file__).with_name("broadcast_ops.db")))).expanduser()
 MAX_IDENTIFIER_LENGTH = 100
 MAX_BROADCAST_URL_LENGTH = 2048
@@ -115,7 +120,13 @@ def init_db() -> None:
                 name TEXT PRIMARY KEY,
                 endpoint TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '직접 등록',
+                last_checked_at TEXT NOT NULL DEFAULT '',
+                health_status TEXT NOT NULL DEFAULT '미점검'
+                    CHECK(health_status IN ('미점검', '정상', '실패')),
+                quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0, 1)),
+                failure_reason TEXT NOT NULL DEFAULT ''
             )"""
         )
         conn.execute(
@@ -159,6 +170,47 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_auto_chats_bot_status "
             "ON auto_chats(bot_id, status, updated_at)"
+        )
+        proxy_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(proxy_settings)")
+        }
+        proxy_migrations = {
+            "source": "TEXT NOT NULL DEFAULT '직접 등록'",
+            "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+            "health_status": "TEXT NOT NULL DEFAULT '미점검'",
+            "quarantined": "INTEGER NOT NULL DEFAULT 0",
+            "failure_reason": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in proxy_migrations.items():
+            if column not in proxy_columns:
+                conn.execute(
+                    f"ALTER TABLE proxy_settings ADD COLUMN {column} {definition}"
+                )
+        duplicate_endpoints = conn.execute(
+            "SELECT endpoint FROM proxy_settings GROUP BY endpoint HAVING COUNT(*) > 1"
+        ).fetchall()
+        for duplicate_endpoint in duplicate_endpoints:
+            duplicate_names = conn.execute(
+                "SELECT name FROM proxy_settings WHERE endpoint=? ORDER BY rowid",
+                (duplicate_endpoint["endpoint"],),
+            ).fetchall()
+            canonical_name = duplicate_names[0]["name"]
+            for duplicate_name in duplicate_names[1:]:
+                conn.execute(
+                    "UPDATE active_bots SET proxy_name=? WHERE proxy_name=?",
+                    (canonical_name, duplicate_name["name"]),
+                )
+                conn.execute(
+                    "DELETE FROM proxy_settings WHERE name=?",
+                    (duplicate_name["name"],),
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_settings_endpoint "
+            "ON proxy_settings(endpoint)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proxy_settings_inventory "
+            "ON proxy_settings(enabled, quarantined, health_status, updated_at)"
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS viewer_plans (
@@ -357,6 +409,195 @@ def normalize_proxy_endpoint(value: str) -> str:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return urlunsplit((parsed.scheme.lower(), f"{host}:{port}", "", "", ""))
+
+
+def parse_proxy_inventory(raw_text: str) -> tuple[list[str], list[str], int]:
+    """Validate and deduplicate newline/CSV-like proxy inventory input."""
+    if len(raw_text.encode("utf-8")) > MAX_PROXY_IMPORT_BYTES:
+        raise ValueError("프록시 가져오기 데이터는 1MB 이하여야 합니다.")
+    lines = raw_text.splitlines()
+    if len(lines) > MAX_PROXY_IMPORT_LINES:
+        raise ValueError(f"프록시는 한 번에 {MAX_PROXY_IMPORT_LINES}줄까지 가져올 수 있습니다.")
+    endpoints: list[str] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    duplicates = 0
+    for line_number, raw_line in enumerate(lines, start=1):
+        value = raw_line.strip().lstrip("\ufeff")
+        if not value or value.startswith("#"):
+            continue
+        candidate = value.split(",", 1)[0].strip()
+        try:
+            endpoint = normalize_proxy_endpoint(candidate)
+        except ValueError as exc:
+            errors.append(f"{line_number}행: {exc}")
+            continue
+        if endpoint in seen:
+            duplicates += 1
+            continue
+        seen.add(endpoint)
+        endpoints.append(endpoint)
+    return endpoints, errors, duplicates
+
+
+def _proxy_inventory_name(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    host = (parsed.hostname or "proxy").replace(":", "-")[:40]
+    digest = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:8]
+    return f"공개-{parsed.scheme}-{host}-{parsed.port}-{digest}"[:MAX_IDENTIFIER_LENGTH]
+
+
+def save_proxy(
+    name: str,
+    endpoint: str,
+    *,
+    enabled: bool = True,
+    source: str = "직접 등록",
+) -> bool:
+    """Save one credential-free proxy; return False when its endpoint exists."""
+    normalized_name = normalized_identifier(name, "프록시 이름")
+    normalized_endpoint = normalize_proxy_endpoint(endpoint)
+    normalized_source = normalized_identifier(source, "프록시 출처")
+    with connection() as conn:
+        duplicate = conn.execute(
+            "SELECT name FROM proxy_settings WHERE endpoint=? AND name<>?",
+            (normalized_endpoint, normalized_name),
+        ).fetchone()
+        if duplicate is not None:
+            return False
+        conn.execute(
+            "INSERT INTO proxy_settings "
+            "(name, endpoint, enabled, updated_at, source, last_checked_at, "
+            "health_status, quarantined, failure_reason) "
+            "VALUES (?, ?, ?, ?, ?, '', '미점검', 0, '') "
+            "ON CONFLICT(name) DO UPDATE SET endpoint=excluded.endpoint, "
+            "enabled=excluded.enabled, updated_at=excluded.updated_at, "
+            "source=excluded.source, last_checked_at='', health_status='미점검', "
+            "quarantined=0, failure_reason=''",
+            (
+                normalized_name,
+                normalized_endpoint,
+                int(enabled),
+                now(),
+                normalized_source,
+            ),
+        )
+    return True
+
+
+def import_proxy_inventory(raw_text: str, source: str) -> dict[str, Any]:
+    """Import valid unique endpoints without replacing existing inventory."""
+    normalized_source = normalized_identifier(source, "프록시 출처")
+    endpoints, errors, input_duplicates = parse_proxy_inventory(raw_text)
+    imported = 0
+    existing = 0
+    with connection() as conn:
+        known = {
+            row["endpoint"]
+            for row in conn.execute("SELECT endpoint FROM proxy_settings").fetchall()
+        }
+        timestamp = now()
+        for endpoint in endpoints:
+            if endpoint in known:
+                existing += 1
+                continue
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO proxy_settings "
+                "(name, endpoint, enabled, updated_at, source, last_checked_at, "
+                "health_status, quarantined, failure_reason) "
+                "VALUES (?, ?, 1, ?, ?, '', '미점검', 0, '')",
+                (_proxy_inventory_name(endpoint), endpoint, timestamp, normalized_source),
+            )
+            if getattr(cursor, "rowcount", 1) == 0:
+                existing += 1
+            else:
+                known.add(endpoint)
+                imported += 1
+    return {
+        "imported": imported,
+        "duplicates": input_duplicates + existing,
+        "invalid": len(errors),
+        "errors": errors,
+    }
+
+
+def check_proxy_connection(endpoint: str, timeout_seconds: float = 3.0) -> None:
+    """Check endpoint TCP reachability only; never sends application traffic."""
+    normalized_endpoint = normalize_proxy_endpoint(endpoint)
+    parsed = urlsplit(normalized_endpoint)
+    with socket.create_connection(
+        (parsed.hostname or "", parsed.port or 0), timeout=timeout_seconds
+    ):
+        pass
+
+
+def check_proxy_inventory_health(
+    names: list[str] | None = None,
+    timeout_seconds: float = 3.0,
+) -> dict[str, bool]:
+    with connection() as conn:
+        if names is None:
+            proxies = conn.execute(
+                "SELECT name, endpoint FROM proxy_settings ORDER BY rowid"
+            ).fetchall()
+        else:
+            proxies = []
+            for name in names:
+                proxy = conn.execute(
+                    "SELECT name, endpoint FROM proxy_settings WHERE name=?", (name,)
+                ).fetchone()
+                if proxy is None:
+                    raise ValueError("점검할 프록시를 찾을 수 없습니다.")
+                proxies.append(proxy)
+    if not proxies:
+        return {}
+
+    def probe(proxy: Any) -> tuple[str, bool, str]:
+        try:
+            check_proxy_connection(proxy["endpoint"], timeout_seconds)
+        except (OSError, ValueError) as exc:
+            return proxy["name"], False, f"연결 실패 ({type(exc).__name__})"
+        return proxy["name"], True, ""
+
+    worker_count = min(20, len(proxies))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(probe, proxies))
+    checked_at = now()
+    with connection() as conn:
+        for name, healthy, reason in results:
+            if healthy:
+                conn.execute(
+                    "UPDATE proxy_settings SET health_status='정상', quarantined=0, "
+                    "failure_reason='', last_checked_at=?, updated_at=? WHERE name=?",
+                    (checked_at, checked_at, name),
+                )
+            else:
+                conn.execute(
+                    "UPDATE proxy_settings SET enabled=0, health_status='실패', "
+                    "quarantined=1, failure_reason=?, last_checked_at=?, updated_at=? "
+                    "WHERE name=?",
+                    (reason, checked_at, checked_at, name),
+                )
+    return {name: healthy for name, healthy, _ in results}
+
+
+def check_proxy_health(name: str, timeout_seconds: float = 3.0) -> bool:
+    return check_proxy_inventory_health([name], timeout_seconds)[name]
+
+
+def set_proxy_enabled(name: str, enabled: bool) -> None:
+    with connection() as conn:
+        proxy = conn.execute(
+            "SELECT quarantined FROM proxy_settings WHERE name=?", (name,)
+        ).fetchone()
+        if proxy is None:
+            raise ValueError("프록시를 찾을 수 없습니다.")
+        if enabled and proxy["quarantined"]:
+            raise ValueError("격리된 프록시는 연결 상태 점검을 통과한 뒤 활성화하세요.")
+        conn.execute(
+            "UPDATE proxy_settings SET enabled=?, updated_at=? WHERE name=?",
+            (int(enabled), now(), name),
+        )
 
 
 def set_bot_status(bot_id: str, status: str) -> None:
@@ -952,7 +1193,9 @@ def main() -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success("방송 URL과 가동 계획을 시작했습니다.")
+                st.success(
+                    "로컬 가동 계획을 저장했습니다. 외부 트래픽은 생성하지 않았습니다."
+                )
                 st.rerun()
 
         show_completed_plans = st.checkbox("종료된 계획 표시", value=False)
@@ -997,49 +1240,130 @@ def main() -> None:
             st.info("등록된 시청자 계획이 없습니다.")
 
     with proxy_tab:
-        st.subheader("플랫폼/P2P 프록시 설정")
+        st.subheader("플랫폼/P2P 프록시 인벤토리")
+        st.caption(
+            "http/https/socks4/socks5 엔드포인트를 관리합니다. 상태 점검은 TCP 도달성만 "
+            "확인하며 시청자·시청시간·채팅 트래픽을 만들지 않습니다. 인증정보가 포함된 "
+            "주소는 저장하지 않습니다."
+        )
         with st.form("proxy_form"):
             proxy_name = st.text_input("프록시 이름").strip()
             proxy_endpoint = st.text_input(
                 "프록시 주소", placeholder="http://127.0.0.1:8080"
             ).strip()
+            proxy_source = st.text_input(
+                "프록시 출처", value="직접 등록", key="single_proxy_source"
+            ).strip()
             proxy_enabled = st.checkbox("사용", value=True)
-            save_proxy = st.form_submit_button("프록시 저장")
-        if save_proxy:
+            save_proxy_requested = st.form_submit_button("프록시 저장")
+        if save_proxy_requested:
             try:
-                proxy_name = normalized_identifier(proxy_name, "프록시 이름")
                 if not proxy_endpoint:
                     raise ValueError("프록시 주소를 입력하세요.")
-                normalized_endpoint = normalize_proxy_endpoint(proxy_endpoint)
+                saved = save_proxy(
+                    proxy_name,
+                    proxy_endpoint,
+                    enabled=proxy_enabled,
+                    source=proxy_source,
+                )
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                with connection() as conn:
-                    conn.execute(
-                        "INSERT INTO proxy_settings "
-                        "(name, endpoint, enabled, updated_at) VALUES (?, ?, ?, ?) "
-                        "ON CONFLICT(name) DO UPDATE SET endpoint=excluded.endpoint, "
-                        "enabled=excluded.enabled, updated_at=excluded.updated_at",
-                        (proxy_name, normalized_endpoint, int(proxy_enabled), now()),
-                    )
-                st.success("프록시 설정을 저장했습니다.")
+                if saved:
+                    st.success("프록시 설정을 저장했습니다.")
+                else:
+                    st.info("같은 프록시 주소가 이미 있어 중복 등록하지 않았습니다.")
+                st.rerun()
+
+        with st.form("proxy_bulk_import_form"):
+            bulk_source = st.text_input(
+                "일괄 가져오기 출처", value="공개 목록", key="bulk_proxy_source"
+            ).strip()
+            bulk_text = st.text_area(
+                "프록시 일괄 붙여넣기",
+                placeholder="http://host:port\nsocks5://host:port",
+                height=140,
+            )
+            bulk_file = st.file_uploader(
+                "프록시 파일 가져오기", type=["txt", "csv"], max_upload_size=1
+            )
+            import_proxies = st.form_submit_button("일괄 가져오기")
+        if import_proxies:
+            try:
+                file_text = ""
+                if bulk_file is not None:
+                    file_bytes = bulk_file.getvalue()
+                    if len(file_bytes) > MAX_PROXY_IMPORT_BYTES:
+                        raise ValueError("프록시 가져오기 파일은 1MB 이하여야 합니다.")
+                    try:
+                        file_text = file_bytes.decode("utf-8-sig")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError("프록시 파일은 UTF-8 텍스트여야 합니다.") from exc
+                combined_text = "\n".join(
+                    part for part in (bulk_text, file_text) if part
+                )
+                if not combined_text.strip():
+                    raise ValueError("붙여넣을 프록시 또는 가져올 파일을 선택하세요.")
+                result = import_proxy_inventory(combined_text, bulk_source)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.success(
+                    f"가져오기 완료: 신규 {result['imported']}개, "
+                    f"중복 제외 {result['duplicates']}개, 형식 오류 {result['invalid']}개"
+                )
+                if result["errors"]:
+                    st.warning("\n".join(result["errors"][:20]))
                 st.rerun()
         if proxies:
+            if st.button("전체 연결 상태 점검", key="check_all_proxies"):
+                health_results = check_proxy_inventory_health()
+                passed = sum(health_results.values())
+                st.success(
+                    f"연결 상태 점검 완료: 정상 {passed}개, "
+                    f"실패·격리 {len(proxies) - passed}개"
+                )
+                st.rerun()
+            display_rows = [
+                {
+                    "이름": proxy["name"],
+                    "주소": proxy["endpoint"],
+                    "활성": bool(proxy["enabled"]),
+                    "상태": proxy["health_status"],
+                    "격리": bool(proxy["quarantined"]),
+                    "출처": proxy["source"],
+                    "마지막 점검": proxy["last_checked_at"] or "미점검",
+                }
+                for proxy in proxies
+            ]
             st.dataframe(
-                pd.DataFrame([dict(row) for row in proxies]),
+                pd.DataFrame(display_rows),
                 width="stretch",
                 hide_index=True,
             )
             for proxy in proxies:
-                next_enabled = 0 if proxy["enabled"] else 1
-                action = "사용 중지" if proxy["enabled"] else "다시 사용"
-                if st.button(action, key=f"toggle_proxy_{proxy['name']}"):
-                    with connection() as conn:
-                        conn.execute(
-                            "UPDATE proxy_settings SET enabled=?, updated_at=? WHERE name=?",
-                            (next_enabled, now(), proxy["name"]),
-                        )
-                    st.rerun()
+                label = (
+                    f"{proxy['name']} · {proxy['health_status']} · "
+                    f"{'격리' if proxy['quarantined'] else '사용 가능'}"
+                )
+                with st.expander(label):
+                    st.write(f"출처: {proxy['source']}")
+                    st.write(f"마지막 점검: {proxy['last_checked_at'] or '미점검'}")
+                    c1, c2 = st.columns(2)
+                    if c1.button(
+                        "연결 상태 점검", key=f"check_proxy_{proxy['name']}"
+                    ):
+                        check_proxy_health(proxy["name"])
+                        st.rerun()
+                    next_enabled = not bool(proxy["enabled"])
+                    action = "사용 중지" if proxy["enabled"] else "다시 사용"
+                    if c2.button(action, key=f"toggle_proxy_{proxy['name']}"):
+                        try:
+                            set_proxy_enabled(proxy["name"], next_enabled)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.rerun()
         else:
             st.info("등록된 프록시가 없습니다.")
 
@@ -1082,7 +1406,9 @@ def main() -> None:
                         )
                     st.rerun()
         enabled_accounts = [row for row in account_rows if row["enabled"]]
-        proxy_rows = [row for row in proxies if row["enabled"]]
+        proxy_rows = [
+            row for row in proxies if row["enabled"] and not row["quarantined"]
+        ]
         bot_platform = st.selectbox("봇 플랫폼", PLATFORMS, key="bot_platform")
         platform_accounts = [
             row for row in enabled_accounts if row["platform"] == bot_platform
