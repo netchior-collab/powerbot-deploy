@@ -51,6 +51,23 @@ TURSO_AUTH_TOKEN = "발급받은-DB-토큰"
 재조회까지 성공해야 원격 배포 완료로 판정한다. `TURSO_DATABASE_URL`을 설정하지 않은
 로컬 실행은 기존 SQLite 파일을 그대로 사용한다.
 
+## 무료 공개 배포 대체 경로: Render + Turso
+
+GitHub OAuth 연결이 차단되는 경우 저장소 루트의 `render.yaml`로 Render 무료 Web
+Service를 생성할 수 있다. Blueprint 생성 화면에서 아래 세 비밀값을 입력하며 저장소에는
+커밋하지 않는다.
+
+```text
+YTPDBOT_ADMIN_PASSWORD
+TURSO_DATABASE_URL
+TURSO_AUTH_TOKEN
+```
+
+Render 무료 서비스는 15분 동안 요청이 없으면 중지되며 다음 접속 때 다시 시작된다.
+로컬 디스크는 영구 저장소가 아니므로 운영 데이터는 계속 Turso에 저장한다. 배포 완료는
+`/_stcore/health` 응답, 관리자 로그인, Turso 쓰기와 새로고침 후 재조회가 모두 확인된
+경우에만 판정한다.
+
 ## Ubuntu + Nginx 배포
 
 1. `ytpdbot_app.py`, `requirements.txt`, `deploy.sh`를 `/opt/ytpdbot`에 복사한다.
