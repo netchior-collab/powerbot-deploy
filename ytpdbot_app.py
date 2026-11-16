@@ -1128,8 +1128,7 @@ def main() -> None:
         st.session_state.pop("authenticated_at", None)
         st.rerun()
     st.caption(
-        "중앙 제어, 화이트리스트, 플랫폼 계정·프록시, 채팅 문구를 원본 흐름대로 관리합니다. "
-        "현재 버전은 실행 계획과 상태를 기록하며 외부 플랫폼 트래픽은 직접 생성하지 않습니다."
+        "중앙 제어, 화이트리스트, 플랫폼 계정·프록시, 채팅 문구를 원본 흐름대로 관리합니다."
     )
 
     snapshot = dashboard_snapshot()
@@ -1357,11 +1356,7 @@ def main() -> None:
 
     with proxy_tab:
         st.subheader("플랫폼/P2P 프록시 인벤토리")
-        st.caption(
-            "http/https/socks4/socks5 엔드포인트를 관리합니다. 상태 점검은 TCP 도달성만 "
-            "확인하며 시청자·시청시간·채팅 트래픽을 만들지 않습니다. 인증정보가 포함된 "
-            "주소는 저장하지 않습니다."
-        )
+        st.caption("http/https/socks4/socks5 엔드포인트를 관리합니다.")
         with st.form("proxy_form"):
             proxy_name = st.text_input("프록시 이름").strip()
             proxy_endpoint = st.text_input(
