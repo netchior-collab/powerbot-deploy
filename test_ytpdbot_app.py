@@ -56,6 +56,8 @@ def test_database_enables_wal_and_creates_required_tables(isolated_database):
         "health_status",
         "quarantined",
         "failure_reason",
+        "last_exit_ip",
+        "latency_ms",
     } <= proxy_columns
 
 
@@ -288,6 +290,75 @@ def test_proxy_health_failure_quarantines_and_success_allows_reactivation(
             "FROM proxy_settings WHERE name='점검 대상'"
         ).fetchone()
     assert recovered == (1, "정상", 0, "")
+
+
+def test_verify_proxy_route_sends_request_through_proxy_and_activates(
+    isolated_database, monkeypatch
+):
+    app.save_proxy(
+        "실제 경유",
+        "http://proxy.example:8080",
+        enabled=False,
+        source="테스트",
+    )
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ip": "203.0.113.7"}
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    elapsed = iter([10.0, 10.125])
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    monkeypatch.setattr(app.time, "perf_counter", lambda: next(elapsed))
+
+    result = app.verify_proxy_route("실제 경유")
+
+    assert result == {
+        "name": "실제 경유",
+        "endpoint": "http://proxy.example:8080",
+        "exit_ip": "203.0.113.7",
+        "latency_ms": 125,
+    }
+    assert calls[0][0] == app.PROXY_EGRESS_CHECK_URL
+    assert calls[0][1]["proxies"] == {
+        "http": "http://proxy.example:8080",
+        "https": "http://proxy.example:8080",
+    }
+    with sqlite3.connect(isolated_database) as connection:
+        stored = connection.execute(
+            "SELECT enabled, health_status, quarantined, last_exit_ip, latency_ms "
+            "FROM proxy_settings WHERE name='실제 경유'"
+        ).fetchone()
+    assert stored == (1, "정상", 0, "203.0.113.7", 125)
+
+
+def test_verify_proxy_route_failure_disables_and_quarantines(
+    isolated_database, monkeypatch
+):
+    app.save_proxy("실패 경유", "socks5://proxy.example:1080", source="테스트")
+
+    def fail_get(*args, **kwargs):
+        del args, kwargs
+        raise app.requests.exceptions.ProxyError("private failure detail")
+
+    monkeypatch.setattr(app.requests, "get", fail_get)
+
+    with pytest.raises(ValueError, match="실제 프록시 경유 요청에 실패"):
+        app.verify_proxy_route("실패 경유")
+
+    with sqlite3.connect(isolated_database) as connection:
+        stored = connection.execute(
+            "SELECT enabled, health_status, quarantined, failure_reason, "
+            "last_exit_ip, latency_ms FROM proxy_settings WHERE name='실패 경유'"
+        ).fetchone()
+    assert stored == (0, "실패", 1, "실제 경유 실패 (ProxyError)", "", 0)
 
 
 def test_proxy_connection_check_uses_endpoint_tcp_reachability():
@@ -971,6 +1042,15 @@ def test_streamlit_connection_bot_and_chat_buttons(tmp_path, monkeypatch):
     database = tmp_path / "connection-bot-chat-buttons.sqlite3"
     monkeypatch.setenv("YTPDBOT_LOCAL_DESKTOP", "1")
     monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
+
+    class FakeProxyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ip": "203.0.113.19"}
+
+    monkeypatch.setattr(app.requests, "get", lambda *args, **kwargs: FakeProxyResponse())
     app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
 
     app_test.run(timeout=10)
@@ -988,6 +1068,9 @@ def test_streamlit_connection_bot_and_chat_buttons(tmp_path, monkeypatch):
         assert connection.execute(
             "SELECT endpoint, enabled FROM proxy_settings WHERE name='검증 프록시'"
         ).fetchone() == ("http://127.0.0.1:8080", 1)
+    assert any(
+        button.key == "route_proxy_검증 프록시" for button in app_test.button
+    )
 
     proxy_toggle = next(
         button
@@ -1004,6 +1087,11 @@ def test_streamlit_connection_bot_and_chat_buttons(tmp_path, monkeypatch):
         for button in app_test.button
         if button.key == "toggle_proxy_검증 프록시"
     ).click().run(timeout=10)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT enabled, last_exit_ip FROM proxy_settings "
+            "WHERE name='검증 프록시'"
+        ).fetchone() == (1, "203.0.113.19")
 
     next(
         field for field in app_test.text_input if field.label == "계정 이름"
