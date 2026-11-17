@@ -53,33 +53,75 @@ CHAT_MODES = [
 ]
 DURATION_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5"}
+PUBLIC_PROXY_SOURCE_CATALOG = [
+    {
+        "name": "TheSpeedX / SOCKS-List",
+        "repository": "https://github.com/TheSpeedX/SOCKS-List",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Proxifly / free-proxy-list",
+        "repository": "https://github.com/proxifly/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
+        ],
+    },
+    {
+        "name": "Proxy-Free / free-proxy-list",
+        "repository": "https://github.com/proxy-free/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/socks5.txt"),
+        ],
+    },
+    {
+        "name": "ProxyScrape / free-proxy-list",
+        "repository": "https://github.com/proxyscrape/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/protocols/http/data.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/protocols/socks4/data.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
+        ],
+    },
+    {
+        "name": "Proxmint / free-proxy-list",
+        "repository": "https://github.com/proxmint/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Dahono / free-proxy-list",
+        "repository": "https://github.com/Dahono-com/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/Dahono-com/free-proxy-list/main/proxies/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/Dahono-com/free-proxy-list/main/proxies/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/Dahono-com/free-proxy-list/main/proxies/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Litport / free-proxy-list",
+        "repository": "https://github.com/litportnet/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/socks5.txt"),
+        ],
+    },
+]
 PUBLIC_PROXY_SOURCES = [
-    (
-        "http",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-    ),
-    (
-        "socks5",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-    ),
-    (
-        "http",
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
-        "proxies/protocols/http/data.txt",
-    ),
-    (
-        "socks5",
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
-        "proxies/protocols/socks5/data.txt",
-    ),
-    (
-        "http",
-        "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/http.txt",
-    ),
-    (
-        "socks5",
-        "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/socks5.txt",
-    ),
+    feed
+    for source in PUBLIC_PROXY_SOURCE_CATALOG
+    for feed in source["feeds"]
 ]
 MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
@@ -1883,6 +1925,21 @@ def main() -> None:
     with proxy_tab:
         st.subheader("플랫폼/P2P 프록시 인벤토리")
         st.caption("http/https/socks4/socks5 엔드포인트를 관리합니다.")
+        proxy_feed_count = sum(
+            len(source["feeds"]) for source in PUBLIC_PROXY_SOURCE_CATALOG
+        )
+        st.caption(
+            f"자동 수집 출처 {len(PUBLIC_PROXY_SOURCE_CATALOG)}곳 · "
+            f"공개 목록 {proxy_feed_count}개 · HTTP/SOCKS4/SOCKS5"
+        )
+        with st.expander("자동 수집 출처 전체 보기"):
+            for source in PUBLIC_PROXY_SOURCE_CATALOG:
+                protocols = ", ".join(
+                    scheme.upper() for scheme, _ in source["feeds"]
+                )
+                st.markdown(
+                    f"- [{source['name']}]({source['repository']}) — {protocols}"
+                )
         if st.button(
             "공개 프록시 전체 자동 수집·검증",
             key="collect_public_proxies",

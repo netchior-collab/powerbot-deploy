@@ -20,6 +20,32 @@ import ytpdbot_app as app
 BROADCAST_URL = "https://live.example.com/channel/streamer-01"
 
 
+def test_public_proxy_source_catalog_is_flattened_without_missing_feeds():
+    expected_names = {
+        "TheSpeedX / SOCKS-List",
+        "Proxifly / free-proxy-list",
+        "Proxy-Free / free-proxy-list",
+        "ProxyScrape / free-proxy-list",
+        "Proxmint / free-proxy-list",
+        "Dahono / free-proxy-list",
+        "Litport / free-proxy-list",
+    }
+
+    assert {source["name"] for source in app.PUBLIC_PROXY_SOURCE_CATALOG} == expected_names
+    assert len(app.PUBLIC_PROXY_SOURCES) == 21
+    assert len(set(app.PUBLIC_PROXY_SOURCES)) == len(app.PUBLIC_PROXY_SOURCES)
+    assert {scheme for scheme, _ in app.PUBLIC_PROXY_SOURCES} == {
+        "http",
+        "socks4",
+        "socks5",
+    }
+    assert app.PUBLIC_PROXY_SOURCES == [
+        feed
+        for source in app.PUBLIC_PROXY_SOURCE_CATALOG
+        for feed in source["feeds"]
+    ]
+
+
 @pytest.fixture
 def isolated_database(tmp_path, monkeypatch):
     database = tmp_path / "test.sqlite3"
@@ -1106,6 +1132,21 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
         button.label == "공개 프록시 전체 자동 수집·검증"
         for button in app_test.button
     )
+    assert any(
+        "자동 수집 출처 7곳 · 공개 목록 21개" in caption.value
+        for caption in app_test.caption
+    )
+    rendered_source_list = " ".join(item.value for item in app_test.markdown)
+    for source_name in (
+        "TheSpeedX / SOCKS-List",
+        "Proxifly / free-proxy-list",
+        "Proxy-Free / free-proxy-list",
+        "ProxyScrape / free-proxy-list",
+        "Proxmint / free-proxy-list",
+        "Dahono / free-proxy-list",
+        "Litport / free-proxy-list",
+    ):
+        assert source_name in rendered_source_list
     rendered_captions = " ".join(caption.value for caption in app_test.caption)
     assert "외부 플랫폼 트래픽은 직접 생성하지 않습니다" not in rendered_captions
     assert "상태 점검은 TCP 도달성만" not in rendered_captions
