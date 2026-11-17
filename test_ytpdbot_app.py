@@ -249,6 +249,8 @@ def test_public_proxy_collection_fetches_checks_and_saves_live_endpoints(
         "collected": 2,
         "alive": 1,
         "saved": 1,
+        "removed": 0,
+        "reconciled": 1,
         "source_failures": 0,
     }
     with sqlite3.connect(isolated_database) as connection:
@@ -257,6 +259,99 @@ def test_public_proxy_collection_fetches_checks_and_saves_live_endpoints(
             "FROM proxy_settings"
         ).fetchone()
     assert row == ("http://one.example:8080", "자동 수집", 0, "정상", 0)
+
+
+def test_public_proxy_refresh_replaces_stale_auto_pool_and_reassigns_work(
+    isolated_database, monkeypatch
+):
+    timestamp = app.now()
+    app.save_proxy(
+        "이전 자동",
+        "http://stale.example:8080",
+        source="자동 수집",
+    )
+    app.save_proxy(
+        "수동 유지",
+        "http://manual.example:8080",
+        source="직접 등록",
+    )
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bot",
+                "플랫폼",
+                "streamer",
+                "account",
+                "이전 자동",
+                "실행",
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    class ListResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            payload = b"fresh.example:8080\n"
+            return payload if size < 0 else payload[:size]
+
+    monkeypatch.setattr(
+        app,
+        "PUBLIC_PROXY_SOURCES",
+        [("http", "https://lists.example/fresh.txt")],
+    )
+    monkeypatch.setattr(
+        app.urllib.request,
+        "urlopen",
+        lambda request, timeout: ListResponse(),
+    )
+    monkeypatch.setattr(
+        app,
+        "check_proxy_connection",
+        lambda endpoint, timeout_seconds: None,
+    )
+
+    result = app.collect_and_verify_proxies(max_collect=10, workers=2)
+    assert result["removed"] == 1
+    assert result["reconciled"] == 1
+    with app.connection() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM proxy_settings WHERE name='이전 자동'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM proxy_settings WHERE name='수동 유지'"
+        ).fetchone() is not None
+        fresh = connection.execute(
+            "SELECT name FROM proxy_settings WHERE endpoint='http://fresh.example:8080'"
+        ).fetchone()[0]
+
+    class RouteResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ip": "203.0.113.31"}
+
+    monkeypatch.setattr(
+        app.requests,
+        "get",
+        lambda *args, **kwargs: RouteResponse(),
+    )
+    failover = app.activate_proxy_with_failover(
+        fresh, timeout_seconds=1, max_candidates=1, workers=1
+    )
+    assert failover["reassigned_bots"] == 1
+    with app.connection() as connection:
+        bot = connection.execute(
+            "SELECT proxy_name, status FROM active_bots WHERE id='bot'"
+        ).fetchone()
+    assert tuple(bot) == (fresh, "실행")
 
 
 def test_proxy_health_failure_discards_proxy(isolated_database, monkeypatch):

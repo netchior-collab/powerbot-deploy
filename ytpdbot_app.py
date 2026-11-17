@@ -697,7 +697,13 @@ def activate_proxy_with_failover(
         raise ValueError("자동 전환할 프록시가 없습니다.")
 
     discarded: list[str] = []
-    affected_bot_ids: set[str] = set()
+    with connection() as conn:
+        missing_proxy_bots = conn.execute(
+            "SELECT id FROM active_bots WHERE proxy_name<>'' AND status='실행' "
+            "AND NOT EXISTS (SELECT 1 FROM proxy_settings "
+            "WHERE proxy_settings.name=active_bots.proxy_name)"
+        ).fetchall()
+    affected_bot_ids: set[str] = {bot["id"] for bot in missing_proxy_bots}
     winner: dict[str, Any] | None = None
     attempted = 0
     batch_size = min(int(workers), len(candidates))
@@ -904,10 +910,24 @@ def collect_and_verify_proxies(
         return endpoint, True
 
     if not candidates:
+        removed_count = 0
+        if source_failures == 0:
+            with connection() as conn:
+                stale = conn.execute(
+                    "SELECT name FROM proxy_settings WHERE source='자동 수집'"
+                ).fetchall()
+                for proxy in stale:
+                    conn.execute(
+                        "DELETE FROM proxy_settings WHERE name=?",
+                        (proxy["name"],),
+                    )
+                removed_count = len(stale)
         return {
             "collected": 0,
             "alive": 0,
             "saved": 0,
+            "removed": removed_count,
+            "reconciled": int(source_failures == 0),
             "source_failures": source_failures,
         }
 
@@ -917,38 +937,62 @@ def collect_and_verify_proxies(
     alive_endpoints = [endpoint for endpoint, healthy in results if healthy]
 
     saved_count = 0
-    if alive_endpoints:
-        timestamp = now()
-        with connection() as conn:
-            known = {
-                row["endpoint"]
-                for row in conn.execute(
-                    "SELECT endpoint FROM proxy_settings"
-                ).fetchall()
-            }
-            for endpoint in alive_endpoints:
-                if endpoint in known:
-                    continue
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO proxy_settings "
-                    "(name, endpoint, enabled, updated_at, source, last_checked_at, "
-                    "health_status, quarantined, failure_reason) "
-                    "VALUES (?, ?, 0, ?, '자동 수집', ?, '정상', 0, '')",
-                    (
-                        _proxy_inventory_name(endpoint),
-                        endpoint,
-                        timestamp,
-                        timestamp,
-                    ),
+    removed_count = 0
+    timestamp = now()
+    alive_set = set(alive_endpoints)
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = {
+            row["endpoint"]: row
+            for row in conn.execute(
+                "SELECT name, endpoint, source FROM proxy_settings"
+            ).fetchall()
+        }
+        if source_failures == 0:
+            stale_auto = [
+                row
+                for row in existing.values()
+                if row["source"] == "자동 수집"
+                and row["endpoint"] not in alive_set
+            ]
+            for proxy in stale_auto:
+                conn.execute(
+                    "DELETE FROM proxy_settings WHERE name=?", (proxy["name"],)
                 )
-                if getattr(cursor, "rowcount", 1) != 0:
-                    known.add(endpoint)
-                    saved_count += 1
+            removed_count = len(stale_auto)
+        for endpoint in alive_endpoints:
+            known_proxy = existing.get(endpoint)
+            if known_proxy is not None:
+                if known_proxy["source"] == "자동 수집":
+                    conn.execute(
+                        "UPDATE proxy_settings SET enabled=0, updated_at=?, "
+                        "last_checked_at=?, health_status='정상', quarantined=0, "
+                        "failure_reason='', last_exit_ip='', latency_ms=0 "
+                        "WHERE name=?",
+                        (timestamp, timestamp, known_proxy["name"]),
+                    )
+                continue
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO proxy_settings "
+                "(name, endpoint, enabled, updated_at, source, last_checked_at, "
+                "health_status, quarantined, failure_reason) "
+                "VALUES (?, ?, 0, ?, '자동 수집', ?, '정상', 0, '')",
+                (
+                    _proxy_inventory_name(endpoint),
+                    endpoint,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if getattr(cursor, "rowcount", 1) != 0:
+                saved_count += 1
 
     return {
         "collected": len(candidates),
         "alive": len(alive_endpoints),
         "saved": saved_count,
+        "removed": removed_count,
+        "reconciled": int(source_failures == 0),
         "source_failures": source_failures,
     }
 
@@ -1699,6 +1743,7 @@ def main() -> None:
                         with connection() as conn:
                             first_proxy = conn.execute(
                                 "SELECT name FROM proxy_settings "
+                                "WHERE source='자동 수집' "
                                 "ORDER BY enabled DESC, updated_at DESC LIMIT 1"
                             ).fetchone()
                         if first_proxy is not None:
@@ -1711,7 +1756,8 @@ def main() -> None:
                     st.success(
                         f"자동 수집 완료: 후보 {collection_result['collected']}개, "
                         f"정상 {collection_result['alive']}개, "
-                        f"신규 저장 {collection_result['saved']}개"
+                        f"신규 저장 {collection_result['saved']}개, "
+                        f"오래된 항목 삭제 {collection_result['removed']}개"
                     )
                     if failover_result is not None:
                         st.success(
