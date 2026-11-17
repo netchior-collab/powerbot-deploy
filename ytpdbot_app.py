@@ -85,6 +85,12 @@ MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
 MAX_PUBLIC_PROXY_COLLECT = 20000
 MAX_PUBLIC_PROXY_WORKERS = 250
+UI_PUBLIC_PROXY_COLLECT = 3000
+UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 6.0
+UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.75
+UI_PROXY_POOL_TIMEOUT_SECONDS = 3.5
+UI_PROXY_POOL_CANDIDATES = 60
+UI_PROXY_POOL_WORKERS = 30
 MAX_PROXY_FAILOVER_CANDIDATES = 40
 MAX_PROXY_FAILOVER_WORKERS = 10
 MAX_VERIFIED_PROXY_POOL = 10
@@ -1000,9 +1006,9 @@ def collect_and_verify_proxies(
     candidates: list[str] = []
     seen: set[str] = set()
     source_failures = 0
+    source_count = max(1, len(PUBLIC_PROXY_SOURCES))
+    per_source_limit = max(1, (int(max_collect) + source_count - 1) // source_count)
     for default_scheme, source_url in PUBLIC_PROXY_SOURCES:
-        if len(candidates) >= max_collect:
-            break
         try:
             request = urllib.request.Request(
                 source_url,
@@ -1020,6 +1026,7 @@ def collect_and_verify_proxies(
             source_failures += 1
             continue
 
+        source_added = 0
         for raw_line in lines:
             candidate = raw_line.strip().lstrip("\ufeff")
             if not candidate or candidate.startswith("#"):
@@ -1034,7 +1041,8 @@ def collect_and_verify_proxies(
                 continue
             seen.add(endpoint)
             candidates.append(endpoint)
-            if len(candidates) >= max_collect:
+            source_added += 1
+            if source_added >= per_source_limit or len(candidates) >= max_collect:
                 break
 
     def probe(endpoint: str) -> tuple[str, bool]:
@@ -1880,14 +1888,23 @@ def main() -> None:
         ):
             with st.spinner("공개 목록을 수집하고 연결 상태를 확인하는 중입니다..."):
                 try:
-                    collection_result = collect_and_verify_proxies()
+                    collection_result = collect_and_verify_proxies(
+                        max_collect=UI_PUBLIC_PROXY_COLLECT,
+                        workers=MAX_PUBLIC_PROXY_WORKERS,
+                        fetch_timeout_seconds=UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS,
+                        probe_timeout_seconds=UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS,
+                    )
                 except (OSError, RuntimeError, ValueError) as exc:
                     st.error(f"자동 수집에 실패했습니다: {exc}")
                 else:
                     pool_result = None
                     if collection_result["alive"]:
                         try:
-                            pool_result = activate_collected_proxy_pool()
+                            pool_result = activate_collected_proxy_pool(
+                                timeout_seconds=UI_PROXY_POOL_TIMEOUT_SECONDS,
+                                max_candidates=UI_PROXY_POOL_CANDIDATES,
+                                workers=UI_PROXY_POOL_WORKERS,
+                            )
                         except ValueError as exc:
                             st.warning(str(exc))
                     st.success(
