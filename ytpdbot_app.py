@@ -91,6 +91,8 @@ UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.75
 UI_PROXY_POOL_TIMEOUT_SECONDS = 3.5
 UI_PROXY_POOL_CANDIDATES = 60
 UI_PROXY_POOL_WORKERS = 30
+PROXY_INVENTORY_DISPLAY_LIMIT = 100
+PROXY_INVENTORY_CONTROL_LIMIT = 20
 MAX_PROXY_FAILOVER_CANDIDATES = 40
 MAX_PROXY_FAILOVER_WORKERS = 10
 MAX_VERIFIED_PROXY_POOL = 10
@@ -2034,6 +2036,15 @@ def main() -> None:
                     f"실패·폐기 {len(proxies) - passed}개"
                 )
                 st.rerun()
+            prioritized_proxies = [proxy for proxy in proxies if proxy["enabled"]]
+            prioritized_proxies.extend(
+                proxy for proxy in proxies if not proxy["enabled"]
+            )
+            visible_proxies = prioritized_proxies[:PROXY_INVENTORY_DISPLAY_LIMIT]
+            st.caption(
+                f"전체 {len(proxies)}개 중 활성·최신 {len(visible_proxies)}개를 표시합니다. "
+                "전체 목록은 CSV로 내려받을 수 있습니다."
+            )
             display_rows = [
                 {
                     "이름": proxy["name"],
@@ -2046,14 +2057,14 @@ def main() -> None:
                     "응답(ms)": int(proxy["latency_ms"] or 0),
                     "마지막 점검": proxy["last_checked_at"] or "미점검",
                 }
-                for proxy in proxies
+                for proxy in visible_proxies
             ]
             st.dataframe(
                 pd.DataFrame(display_rows),
                 width="stretch",
                 hide_index=True,
             )
-            for proxy in proxies:
+            for proxy in visible_proxies[:PROXY_INVENTORY_CONTROL_LIMIT]:
                 label = (
                     f"{proxy['name']} · {proxy['health_status']} · "
                     f"{'격리' if proxy['quarantined'] else '사용 가능'}"
