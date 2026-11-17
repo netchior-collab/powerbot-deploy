@@ -554,6 +554,63 @@ def test_failed_proxy_pauses_dependent_bot_and_chat(isolated_database, monkeypat
     assert chat_status == "일시중지"
 
 
+def test_inventory_health_check_fails_over_running_work(
+    isolated_database, monkeypatch
+):
+    timestamp = app.now()
+    app.save_proxy("실패 프록시", "http://bad.example:8080", source="테스트")
+    app.save_proxy("정상 프록시", "http://good.example:8080", source="테스트")
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bot",
+                "팬더티비",
+                BROADCAST_URL,
+                "계정",
+                "실패 프록시",
+                "실행",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO auto_chats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("chat", "bot", "메시지", 30, "실행", timestamp, timestamp),
+        )
+
+    def fake_tcp_check(endpoint, timeout_seconds):
+        del timeout_seconds
+        if "bad.example" in endpoint:
+            raise OSError("unreachable")
+
+    monkeypatch.setattr(app, "check_proxy_connection", fake_tcp_check)
+    monkeypatch.setattr(
+        app,
+        "_probe_proxy_route",
+        lambda endpoint, timeout: {
+            "endpoint": endpoint,
+            "exit_ip": "203.0.113.20",
+            "latency_ms": 12,
+        },
+    )
+
+    assert app.check_proxy_inventory_health() == {
+        "실패 프록시": False,
+        "정상 프록시": True,
+    }
+    with sqlite3.connect(isolated_database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM proxy_settings WHERE name='실패 프록시'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT proxy_name, status FROM active_bots WHERE id='bot'"
+        ).fetchone() == ("정상 프록시", "실행")
+        assert connection.execute(
+            "SELECT status FROM auto_chats WHERE id='chat'"
+        ).fetchone() == ("실행",)
+
+
 def test_disabling_account_pauses_dependent_bot_and_chat(isolated_database):
     timestamp = app.now()
     with app.connection() as connection:
@@ -776,6 +833,32 @@ def test_viewer_plans_accept_multiple_registered_quantities(isolated_database):
             "SELECT status FROM viewer_plans WHERE id=?", (first,)
         ).fetchone()[0]
     assert status == "일시중지"
+
+
+def test_stopping_instant_viewer_plan_clears_planned_count(isolated_database):
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO whitelist VALUES (?, ?)", (BROADCAST_URL, app.now())
+        )
+    plan_id = app.add_viewer_plan(
+        "기타 방송",
+        BROADCAST_URL,
+        "즉시 투입 계획",
+        100,
+        motion_type=app.MOTION_TYPES[1],
+    )
+    with app.connection() as connection:
+        assert connection.execute(
+            "SELECT current_count FROM viewer_plans WHERE id=?", (plan_id,)
+        ).fetchone()[0] == 100
+
+    app.set_viewer_plan_status(plan_id, "종료")
+
+    with app.connection() as connection:
+        row = connection.execute(
+            "SELECT status, current_count FROM viewer_plans WHERE id=?", (plan_id,)
+        ).fetchone()
+    assert tuple(row) == ("종료", 0)
 
 
 @pytest.mark.parametrize("quantity", [0, -1, 10, 21, 1510, True])

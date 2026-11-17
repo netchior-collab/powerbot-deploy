@@ -818,6 +818,8 @@ def check_proxy_inventory_health(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         results = list(executor.map(probe, proxies))
     checked_at = now()
+    failed_names = [name for name, healthy, _ in results if not healthy]
+    healthy_names = [name for name, healthy, _ in results if healthy]
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         for name, healthy, reason in results:
@@ -828,11 +830,31 @@ def check_proxy_inventory_health(
                     (checked_at, checked_at, name),
                 )
             else:
-                affected_bots = conn.execute(
-                    "SELECT id FROM active_bots WHERE proxy_name=? AND status='실행'",
-                    (name,),
-                ).fetchall()
                 conn.execute("DELETE FROM proxy_settings WHERE name=?", (name,))
+    if failed_names:
+        with connection() as conn:
+            fallback = conn.execute(
+                "SELECT name FROM proxy_settings "
+                "ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, enabled DESC, "
+                "CASE health_status WHEN '정상' THEN 0 WHEN '미점검' THEN 1 ELSE 2 END, "
+                "updated_at DESC LIMIT 1",
+                (healthy_names[0] if healthy_names else "",),
+            ).fetchone()
+        if fallback is not None:
+            try:
+                activate_proxy_with_failover(fallback["name"])
+            except ValueError:
+                # activate_proxy_with_failover already pauses dependent work
+                # when no usable route remains.
+                pass
+        else:
+            with connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                affected_bots = conn.execute(
+                    "SELECT id FROM active_bots WHERE proxy_name<>'' AND status='실행' "
+                    "AND NOT EXISTS (SELECT 1 FROM proxy_settings "
+                    "WHERE proxy_settings.name=active_bots.proxy_name)"
+                ).fetchall()
                 for bot in affected_bots:
                     conn.execute(
                         "UPDATE active_bots SET status='일시중지', updated_at=? "
@@ -1363,10 +1385,17 @@ def set_viewer_plan_status(plan_id: str, status: str) -> None:
     if status not in VIEWER_PLAN_STATUSES:
         raise ValueError(f"지원하지 않는 시청자 계획 상태: {status}")
     with connection() as conn:
-        result = conn.execute(
-            "UPDATE viewer_plans SET status=?, updated_at=? WHERE id=?",
-            (status, now(), plan_id),
-        )
+        if status == "종료":
+            result = conn.execute(
+                "UPDATE viewer_plans SET status=?, current_count=0, updated_at=? "
+                "WHERE id=?",
+                (status, now(), plan_id),
+            )
+        else:
+            result = conn.execute(
+                "UPDATE viewer_plans SET status=?, updated_at=? WHERE id=?",
+                (status, now(), plan_id),
+            )
         if result.rowcount != 1:
             raise ValueError("시청자 계획을 찾을 수 없습니다.")
 
@@ -1927,6 +1956,7 @@ def main() -> None:
                                 f"{route_result['latency_ms']}ms · "
                                 f"실패 폐기 {len(route_result['discarded'])}개"
                             )
+                            st.rerun()
                     next_enabled = not bool(proxy["enabled"])
                     action = (
                         "사용 중지"
