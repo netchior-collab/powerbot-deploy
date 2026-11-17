@@ -1003,11 +1003,13 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
     database = tmp_path / "ui.sqlite3"
     monkeypatch.setenv("YTPDBOT_ADMIN_PASSWORD", "test-password")
     monkeypatch.setenv("YTPDBOT_DB_PATH", str(database))
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "0123456789abcdef")
     app_test = AppTest.from_file(str(Path(__file__).with_name("ytpdbot_app.py")))
 
     app_test.run(timeout=10)
     assert not app_test.exception
     assert app_test.title[0].value == "방송 운영 대시보드 로그인"
+    assert any("배포 버전: 01234567" in item.value for item in app_test.caption)
     assert not database.exists()
 
     app_test.text_input[0].input("test-password")

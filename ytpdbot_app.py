@@ -102,6 +102,11 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def deployment_version() -> str:
+    commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
+    return commit[:8] if commit else "local"
+
+
 @contextmanager
 def connection() -> Iterator[Any]:
     remote_url = os.getenv("TURSO_DATABASE_URL", "").strip()
@@ -1479,6 +1484,7 @@ def login() -> None:
         st.warning("보안을 위해 로그인 세션이 만료되었습니다. 다시 로그인하세요.")
 
     st.title("방송 운영 대시보드 로그인")
+    st.caption(f"배포 버전: {deployment_version()}")
     locked_until = float(st.session_state.get("login_locked_until", 0.0))
     if current_timestamp < locked_until:
         remaining = max(1, int(locked_until - current_timestamp) + 1)
@@ -1527,7 +1533,8 @@ def main() -> None:
         st.session_state.pop("authenticated_at", None)
         st.rerun()
     st.caption(
-        "중앙 제어, 화이트리스트, 플랫폼 계정·프록시, 채팅 문구를 원본 흐름대로 관리합니다."
+        "중앙 제어, 화이트리스트, 플랫폼 계정·프록시, 채팅 문구를 원본 흐름대로 관리합니다. "
+        f"· 배포 버전: {deployment_version()}"
     )
 
     snapshot = dashboard_snapshot()
