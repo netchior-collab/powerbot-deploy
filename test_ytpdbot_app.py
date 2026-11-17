@@ -29,10 +29,18 @@ def test_public_proxy_source_catalog_is_flattened_without_missing_feeds():
         "Proxmint / free-proxy-list",
         "Dahono / free-proxy-list",
         "Litport / free-proxy-list",
+        "Maximilian Feix / free-proxy-list",
+        "HProxy / free-proxy-list",
+        "IPLocate / free-proxy-list",
+        "Thordata / awesome-free-proxy-list",
+        "Proxio / proxy-list",
+        "Databay Labs / free-proxy-list",
+        "FusionProxies / free-proxy-list",
+        "Fyvri / fresh-proxy-list",
     }
 
     assert {source["name"] for source in app.PUBLIC_PROXY_SOURCE_CATALOG} == expected_names
-    assert len(app.PUBLIC_PROXY_SOURCES) == 21
+    assert len(app.PUBLIC_PROXY_SOURCES) == 45
     assert len(set(app.PUBLIC_PROXY_SOURCES)) == len(app.PUBLIC_PROXY_SOURCES)
     assert {scheme for scheme, _ in app.PUBLIC_PROXY_SOURCES} == {
         "http",
@@ -285,6 +293,46 @@ def test_public_proxy_collection_fetches_checks_and_saves_live_endpoints(
             "FROM proxy_settings"
         ).fetchone()
     assert row == ("http://one.example:8080", "자동 수집", 0, "정상", 0)
+
+
+def test_public_proxy_collection_accepts_bounded_prefix_of_large_feed(
+    isolated_database, monkeypatch
+):
+    first_row = b"large-feed.example:8080\n"
+    payload = first_row + (b"# padding\n" * (app.MAX_PROXY_IMPORT_BYTES // 4))
+
+    class LargeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size=-1):
+            return payload if size < 0 else payload[:size]
+
+    monkeypatch.setattr(
+        app,
+        "PUBLIC_PROXY_SOURCES",
+        [("http", "https://lists.example/large.txt")],
+    )
+    monkeypatch.setattr(
+        app.urllib.request,
+        "urlopen",
+        lambda request, timeout: LargeResponse(),
+    )
+    monkeypatch.setattr(
+        app,
+        "check_proxy_connection",
+        lambda endpoint, timeout_seconds: None,
+    )
+
+    result = app.collect_and_verify_proxies(max_collect=10, workers=2)
+
+    assert result["collected"] == 1
+    assert result["alive"] == 1
+    assert result["saved"] == 1
+    assert result["source_failures"] == 0
 
 
 def test_public_proxy_refresh_replaces_stale_auto_pool_and_reassigns_work(
@@ -1133,7 +1181,7 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
         for button in app_test.button
     )
     assert any(
-        "자동 수집 출처 7곳 · 공개 목록 21개" in caption.value
+        "자동 수집 출처 15곳 · 공개 목록 45개" in caption.value
         for caption in app_test.caption
     )
     rendered_source_list = " ".join(item.value for item in app_test.markdown)
@@ -1145,6 +1193,14 @@ def test_streamlit_login_and_dashboard_render(tmp_path, monkeypatch):
         "Proxmint / free-proxy-list",
         "Dahono / free-proxy-list",
         "Litport / free-proxy-list",
+        "Maximilian Feix / free-proxy-list",
+        "HProxy / free-proxy-list",
+        "IPLocate / free-proxy-list",
+        "Thordata / awesome-free-proxy-list",
+        "Proxio / proxy-list",
+        "Databay Labs / free-proxy-list",
+        "FusionProxies / free-proxy-list",
+        "Fyvri / fresh-proxy-list",
     ):
         assert source_name in rendered_source_list
     rendered_captions = " ".join(caption.value for caption in app_test.caption)

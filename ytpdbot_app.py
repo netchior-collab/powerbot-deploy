@@ -117,6 +117,78 @@ PUBLIC_PROXY_SOURCE_CATALOG = [
             ("socks5", "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/socks5.txt"),
         ],
     },
+    {
+        "name": "Maximilian Feix / free-proxy-list",
+        "repository": "https://github.com/maximilianfeix/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/maximilianfeix/free-proxy-list/main/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/maximilianfeix/free-proxy-list/main/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/maximilianfeix/free-proxy-list/main/socks5.txt"),
+        ],
+    },
+    {
+        "name": "HProxy / free-proxy-list",
+        "repository": "https://github.com/hproxy-com/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt"),
+        ],
+    },
+    {
+        "name": "IPLocate / free-proxy-list",
+        "repository": "https://github.com/iplocate/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Thordata / awesome-free-proxy-list",
+        "repository": "https://github.com/Thordata/awesome-free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Proxio / proxy-list",
+        "repository": "https://github.com/proxio-io/proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxio-io/proxy-list/main/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxio-io/proxy-list/main/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxio-io/proxy-list/main/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Databay Labs / free-proxy-list",
+        "repository": "https://github.com/databay-labs/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt"),
+        ],
+    },
+    {
+        "name": "FusionProxies / free-proxy-list",
+        "repository": "https://github.com/FusionProxies/free-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/FusionProxies/free-proxy-list/main/proxies/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/FusionProxies/free-proxy-list/main/proxies/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/FusionProxies/free-proxy-list/main/proxies/socks5.txt"),
+        ],
+    },
+    {
+        "name": "Fyvri / fresh-proxy-list",
+        "repository": "https://github.com/fyvri/fresh-proxy-list",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt"),
+        ],
+    },
 ]
 PUBLIC_PROXY_SOURCES = [
     feed
@@ -1061,10 +1133,13 @@ def collect_and_verify_proxies(
             with urllib.request.urlopen(
                 request, timeout=fetch_timeout_seconds
             ) as response:
-                payload = response.read(MAX_PROXY_IMPORT_BYTES + 1)
-            if len(payload) > MAX_PROXY_IMPORT_BYTES:
-                source_failures += 1
-                continue
+                payload = response.read(MAX_PROXY_IMPORT_BYTES)
+            # Some maintained feeds contain hundreds of thousands of rows. A
+            # bounded prefix is enough because each source has a fair quota;
+            # discard only the possibly truncated final row instead of
+            # rejecting the entire source for being larger than 1 MiB.
+            if len(payload) == MAX_PROXY_IMPORT_BYTES and b"\n" in payload:
+                payload = payload.rsplit(b"\n", 1)[0]
             lines = payload.decode("utf-8", errors="ignore").splitlines()
         except (OSError, ValueError):
             source_failures += 1
@@ -1930,7 +2005,8 @@ def main() -> None:
         )
         st.caption(
             f"자동 수집 출처 {len(PUBLIC_PROXY_SOURCE_CATALOG)}곳 · "
-            f"공개 목록 {proxy_feed_count}개 · HTTP/SOCKS4/SOCKS5"
+            f"공개 목록 {proxy_feed_count}개 · HTTP/SOCKS4/SOCKS5 · "
+            "실행할 때마다 최신 원문 재수집"
         )
         with st.expander("자동 수집 출처 전체 보기"):
             for source in PUBLIC_PROXY_SOURCE_CATALOG:
