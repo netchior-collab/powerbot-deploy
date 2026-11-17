@@ -354,6 +354,73 @@ def test_public_proxy_refresh_replaces_stale_auto_pool_and_reassigns_work(
     assert tuple(bot) == (fresh, "실행")
 
 
+def test_collected_proxy_pool_enables_multiple_routes_and_reassigns_work(
+    isolated_database, monkeypatch
+):
+    timestamp = app.now()
+    for name, endpoint in (
+        ("자동-1", "http://one.example:8080"),
+        ("자동-2", "http://two.example:8080"),
+        ("자동-실패", "http://bad.example:8080"),
+    ):
+        app.save_proxy(name, endpoint, enabled=False, source="자동 수집")
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO active_bots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bot",
+                "플랫폼",
+                "streamer",
+                "account",
+                "자동-실패",
+                "실행",
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO auto_chats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("chat", "bot", "message", 30, "실행", timestamp, timestamp),
+        )
+
+    def fake_probe(endpoint, timeout_seconds):
+        del timeout_seconds
+        if "bad.example" in endpoint:
+            raise app.requests.exceptions.ProxyError("offline")
+        last_octet = "11" if "one.example" in endpoint else "12"
+        latency = 20 if "one.example" in endpoint else 30
+        return {"exit_ip": f"203.0.113.{last_octet}", "latency_ms": latency}
+
+    monkeypatch.setattr(app, "_probe_proxy_route", fake_probe)
+    result = app.activate_collected_proxy_pool(
+        pool_size=2, timeout_seconds=1, max_candidates=3, workers=3
+    )
+
+    assert [winner["name"] for winner in result["winners"]] == ["자동-1", "자동-2"]
+    assert result["discarded"] == ["자동-실패"]
+    assert result["reassigned_bots"] == 1
+    with app.connection() as connection:
+        enabled = connection.execute(
+            "SELECT name, last_exit_ip FROM proxy_settings WHERE enabled=1 ORDER BY name"
+        ).fetchall()
+        bot = connection.execute(
+            "SELECT proxy_name, status FROM active_bots WHERE id='bot'"
+        ).fetchone()
+        chat = connection.execute(
+            "SELECT status FROM auto_chats WHERE id='chat'"
+        ).fetchone()[0]
+        failed = connection.execute(
+            "SELECT 1 FROM proxy_settings WHERE name='자동-실패'"
+        ).fetchone()
+    assert [tuple(row) for row in enabled] == [
+        ("자동-1", "203.0.113.11"),
+        ("자동-2", "203.0.113.12"),
+    ]
+    assert tuple(bot) == ("자동-1", "실행")
+    assert chat == "실행"
+    assert failed is None
+
+
 def test_proxy_health_failure_discards_proxy(isolated_database, monkeypatch):
     assert app.save_proxy("점검 대상", "http://127.0.0.1:8080", source="직접 등록")
 
@@ -742,8 +809,9 @@ def test_resuming_bot_rechecks_disabled_dependencies(
             ("account", "플랫폼", "계정", 1, timestamp),
         )
         connection.execute(
-            "INSERT INTO proxy_settings (name, endpoint, enabled, updated_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO proxy_settings "
+            "(name, endpoint, enabled, updated_at, health_status, last_exit_ip) "
+            "VALUES (?, ?, ?, ?, '정상', '203.0.113.8')",
             ("proxy", "http://127.0.0.1:8080", 1, timestamp),
         )
     bot_id = app.start_bot("플랫폼", BROADCAST_URL, "account", "proxy")
@@ -761,6 +829,23 @@ def test_resuming_bot_rechecks_disabled_dependencies(
             "SELECT status FROM active_bots WHERE id=?", (bot_id,)
         ).fetchone()[0]
     assert status == "일시중지"
+
+
+def test_start_bot_rejects_tcp_only_proxy_without_route_proof(isolated_database):
+    timestamp = app.now()
+    with app.connection() as connection:
+        connection.execute(
+            "INSERT INTO accounts VALUES (?, ?, ?, ?, ?)",
+            ("account", "플랫폼", "계정", 1, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO proxy_settings "
+            "(name, endpoint, enabled, updated_at, health_status, last_exit_ip) "
+            "VALUES (?, ?, 1, ?, '정상', '')",
+            ("tcp-only", "http://127.0.0.1:8080", timestamp),
+        )
+    with pytest.raises(ValueError, match="프록시"):
+        app.start_bot("플랫폼", BROADCAST_URL, "account", "tcp-only")
 
 
 def test_start_bot_rechecks_account_and_prevents_active_duplicate(isolated_database):
@@ -1349,14 +1434,22 @@ def test_streamlit_connection_bot_and_chat_buttons(tmp_path, monkeypatch):
     next(
         field for field in app_test.text_input if field.label == "대상 방송 URL"
     ).input(BROADCAST_URL)
+    proxy_select = next(
+        field for field in app_test.selectbox if field.label == "사용 프록시"
+    )
+    proxy_option = next(
+        option for option in proxy_select.options if option.startswith("검증 프록시 ·")
+    )
+    proxy_select.select(proxy_option)
     next(
         button for button in app_test.button if button.label == "봇 작업 등록"
     ).click().run(timeout=10)
     with sqlite3.connect(database) as connection:
-        bot_id, status = connection.execute(
-            "SELECT id, status FROM active_bots"
+        bot_id, status, proxy_name = connection.execute(
+            "SELECT id, status, proxy_name FROM active_bots"
         ).fetchone()
     assert status == "실행"
+    assert proxy_name == "검증 프록시"
 
     next(
         field for field in app_test.text_area if field.label == "채팅 메시지"
