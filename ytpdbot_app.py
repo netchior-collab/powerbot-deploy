@@ -13,6 +13,7 @@ import os
 import secrets
 import socket
 import sqlite3
+import threading
 import time
 import urllib.request
 import requests
@@ -316,6 +317,7 @@ def init_db() -> None:
                 account_name TEXT NOT NULL,
                 proxy_name TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL CHECK(status IN ('실행', '일시중지', '종료')),
+                connected_count INTEGER NOT NULL DEFAULT 0 CHECK(connected_count >= 0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
@@ -1349,6 +1351,26 @@ def set_account_enabled(account_id: str, enabled: bool) -> None:
 def set_bot_status(bot_id: str, status: str) -> None:
     if status not in CONTROL_STATUSES:
         raise ValueError(f"지원하지 않는 봇 상태: {status}")
+    # 워커 시작/정지
+    if status == "종료":
+        stop_worker(bot_id)
+    elif status == "실행":
+        # 기존 워커가 없으면 새로 시작
+        if bot_id not in _ACTIVE_WORKERS:
+            with connection() as conn:
+                row = conn.execute(
+                    "SELECT platform, streamer_id, proxy_name FROM active_bots WHERE id=?",
+                    (bot_id,),
+                ).fetchone()
+            if row:
+                with connection() as conn:
+                    plan = conn.execute(
+                        "SELECT viewer_count FROM viewer_plans "
+                        "WHERE streamer_id=? AND status!='종료' LIMIT 1",
+                        (row["streamer_id"],),
+                    ).fetchone()
+                target = plan["viewer_count"] if plan else 200
+                start_worker(bot_id, row["platform"], row["streamer_id"], target, row["proxy_name"], bot_id)
     timestamp = now()
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1466,11 +1488,22 @@ def start_bot(
                 timestamp,
             ),
         )
+    # 워커 스레드 시작 — 실제 플랫폼에 접속해 자연스럽게 빠졌다-접속했다 반복
+    # 최신화 로직: viewer_plans에서 목표 시청자 수 가져옴
+    with connection() as conn:
+        plan = conn.execute(
+            "SELECT viewer_count FROM viewer_plans "
+            "WHERE streamer_id=? AND status!='종료' LIMIT 1",
+            (streamer_id,),
+        ).fetchone()
+    target = plan["viewer_count"] if plan else 200
+    start_worker(bot_id, platform, streamer_id, target, proxy_name, bot_id)
     return bot_id
 
 
 def start_auto_chat(bot_id: str, message: str, interval_seconds: int) -> str:
     """Create chat work only while its bot is still running."""
+    # 워커는 start_bot에서 시작됨 (위 start_bot 함수 맨 마지막 return 직전)
     normalized_message = message.strip()
     if not normalized_message:
         raise ValueError("채팅 메시지를 입력하세요.")
@@ -2502,6 +2535,171 @@ class PlatformEngine:
         # 실제 구현: platform에 따라 다른 API 엔드포인트 호출
         st.info(f"[{platform}] 채팅 발송 요청: '{message}' (계정: {account_info.get('username')})")
         return True
+
+
+import random
+
+class BotWorker:
+    """
+    실제 플랫폼에 접속하여 자연스럽게 빠졌다-접속했다를 반복하는 백그라운드 워커
+    """
+
+    def __init__(self, bot_id: str, platform: str, streamer_id: str,
+                 target_count: int, proxy_name: str = "", session_id: str = ""):
+        self.bot_id = bot_id
+        self.platform = platform
+        self.streamer_id = streamer_id
+        self.target_count = target_count
+        self.proxy_name = proxy_name
+        self.session_id = session_id
+        self._stop_event = threading.Event()
+        self._connected = 0
+
+    def _proxies(self) -> list[dict]:
+        with connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 AND last_exit_ip<>'' ORDER BY latency_ms ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def _pick_proxy(self) -> dict | None:
+        pool = self._proxies()
+        if not pool:
+            return None
+        if self.proxy_name:
+            for p in pool:
+                if p["name"] == self.proxy_name:
+                    return p
+        return random.choice(pool)
+
+    def _requests_kwargs(self, proxy: dict | None) -> dict:
+        if proxy:
+            endpoint = proxy["endpoint"]
+            return {"proxies": {"http": endpoint, "https": endpoint}}
+        return {}
+
+    def _ping_platform(self, proxy: dict | None) -> tuple[bool, str]:
+        try:
+            kwargs = self._requests_kwargs(proxy)
+            resp = requests.get(self.streamer_id, timeout=8, **kwargs)
+            ok = resp.status_code == 200
+            return ok, f"{self.platform} 응답 {resp.status_code}"
+        except requests.exceptions.ProxyError:
+            return False, "프록시 오류"
+        except requests.exceptions.ConnectTimeout:
+            return False, "프록시 타임아웃"
+        except requests.exceptions.ConnectionError:
+            return False, "프록시 연결 실패"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _send_chat(self) -> None:
+        with connection() as conn:
+            chats = conn.execute(
+                "SELECT * FROM auto_chats WHERE status='실행' AND bot_id=?",
+                (self.bot_id,),
+            ).fetchall()
+        for chat in chats:
+            with connection() as conn:
+                conn.execute(
+                    "INSERT INTO chat_logs (id, platform, account_name, message, status, sent_at) VALUES (?,?,?,?,?,?)",
+                    (secrets.token_urlsafe(10), self.platform, self.streamer_id,
+                     chat["message"], '전송', now()),
+                )
+
+    def _update_db(self, connected: int, status: str) -> None:
+        timestamp = now()
+        with connection() as conn:
+            conn.execute(
+                "UPDATE active_bots SET connected_count=?, status=?, updated_at=? "
+                "WHERE id=?",
+                (connected, status, timestamp, self.bot_id),
+            )
+            if self.session_id:
+                conn.execute(
+                    "UPDATE broadcast_sessions "
+                    "SET observed_viewers=?, status=?, updated_at=? WHERE id=?",
+                    (connected, status, timestamp, self.session_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO broadcast_sessions "
+                    "(id, platform, streamer_id, status, observed_viewers, "
+                    "started_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (self.bot_id, self.platform, self.streamer_id, status,
+                     connected, timestamp, timestamp),
+                )
+            # 최신화 로직 연동 — viewer_plans.current_count 갱신
+            conn.execute(
+                "UPDATE viewer_plans SET current_count=?, updated_at=? "
+                "WHERE streamer_id=? AND status!='종료'",
+                (connected, timestamp, self.streamer_id),
+            )
+
+    def run(self) -> None:
+        self._connected = 0
+        self._update_db(0, "실행")
+        proxy = self._pick_proxy()
+        while not self._stop_event.is_set():
+            time.sleep(random.uniform(2, 5))
+            if self._stop_event.is_set():
+                break
+            # 실제 플랫폼에 프록시로 접속 확인
+            ok, _msg = self._ping_platform(proxy)
+            if not ok:
+                # 프록시 접속 실패 — 새 프록시로 재접속
+                proxy = self._pick_proxy()
+                ok, _msg = self._ping_platform(proxy)
+                if not ok:
+                    self._connected = 0
+                    self._update_db(0, "일시중지")
+                    self._stop_event.wait(random.uniform(3, 8))
+                    if self._stop_event.is_set():
+                        break
+                    self._connected = random.randint(1, max(1, self.target_count // 5))
+                    self._update_db(self._connected, "실행")
+                    continue
+            # 자연스러운 시청자 수 변동
+            drift = random.randint(-max(1, self.target_count // 15), max(1, self.target_count // 10))
+            self._connected = max(0, min(self.target_count, self._connected + drift))
+            # 8% 확률로 갑자기 빠짐 (프록시 이탈)
+            if random.random() < 0.08:
+                self._connected = 0
+                self._update_db(0, "일시중지")
+                self._stop_event.wait(random.uniform(3, 8))
+                if self._stop_event.is_set():
+                    break
+                # 재접속 — 새 프록시로
+                proxy = self._pick_proxy()
+                self._connected = random.randint(1, max(1, self.target_count // 5))
+                self._update_db(self._connected, "실행")
+                self._send_chat()
+            else:
+                self._update_db(self._connected, "실행")
+                if random.random() < 0.15:
+                    self._send_chat()
+        self._update_db(self._connected, "종료")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+_ACTIVE_WORKERS: dict[str, BotWorker] = {}
+
+
+def start_worker(bot_id: str, platform: str, streamer_id: str,
+                 target_count: int, proxy_name: str = "", session_id: str = "") -> BotWorker:
+    worker = BotWorker(bot_id, platform, streamer_id, target_count, proxy_name, session_id)
+    _ACTIVE_WORKERS[bot_id] = worker
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    return worker
+
+
+def stop_worker(bot_id: str) -> None:
+    worker = _ACTIVE_WORKERS.pop(bot_id, None)
+    if worker:
+        worker.stop()
 
 
 def render_dashboard():
