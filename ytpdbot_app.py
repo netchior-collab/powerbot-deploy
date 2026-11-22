@@ -1700,7 +1700,7 @@ def refresh_viewer_plan_progress() -> int:
     with connection() as conn:
         rows = conn.execute(
             "SELECT id, viewer_count, motion_type, status, started_at, ends_at, "
-            "current_count FROM viewer_plans WHERE status='대기'"
+            "current_count FROM viewer_plans WHERE status IN ('대기', '가동 중')"
         ).fetchall()
         for row in rows:
             if "서서히" not in row["motion_type"]:
@@ -2045,11 +2045,13 @@ def main() -> None:
                         "계획 일시중지", key=f"pause_viewer_plan_{plan['id']}"
                     ):
                         set_viewer_plan_status(plan["id"], "일시중지")
+                        stop_worker(plan["id"])
                         st.rerun()
                     if plan["status"] == "일시중지" and c1.button(
                         "계획 다시 대기", key=f"resume_viewer_plan_{plan['id']}"
                     ):
                         set_viewer_plan_status(plan["id"], "대기")
+                        start_worker(plan["id"], plan["platform"], plan["streamer_id"], int(plan["viewer_count"]), "", plan["id"])
                         st.rerun()
                     if plan["status"] != "종료" and c2.button(
                         "가동 계획 중지", key=f"stop_viewer_plan_{plan['id']}"
