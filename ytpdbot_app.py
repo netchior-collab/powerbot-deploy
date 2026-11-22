@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.request
 import requests
+import random
 import re
 import websocket
 from concurrent.futures import ThreadPoolExecutor
@@ -2658,6 +2659,44 @@ class BotWorker:
             m = re.search(r"(?:/live/|youtu\.be/|v=)([A-Za-z0-9_-]+)", self.streamer_id)
             return m.group(1) if m else self.streamer_id
 
+    def _download_hls(self, json_text, session=None, **kw) -> bool:
+        """플렉스티비: sources[].url(m3u8) → segment 다운로드 = 실제 시청자"""
+        try:
+            d = json.loads(json_text)
+            sources = d.get("sources", [])
+            m3u8 = sources[0]["url"] if sources else ""
+            if not m3u8:
+                return False
+            pl = (session or requests).get(m3u8, timeout=8, **kw)
+            if pl.status_code != 200:
+                return False
+            lines = [l.strip() for l in pl.text.splitlines() if l.strip() and not l.startswith("#")]
+            if not lines:
+                return False
+            (session or requests).get(lines[0], timeout=8, stream=True, **kw)
+            return True
+        except Exception:
+            return False
+
+    def _extract_yt_stream(self, html) -> str:
+        """유튜브: HTML → videoplayback(HLS) URL 추출"""
+        m = re.search(r'"streamingData":\{"formats":\[', html)
+        if not m:
+            m = re.search(r'"streamingData":\{', html)
+        if not m:
+            return ""
+        sd = m.group(0)
+        for pat in [
+            r'"formatId":"18","videoId":"[^"]*","url":"([^"]+)"',
+            r'"formatId":"18","url":"([^"]+)"',
+            r'"url":"https://manifest\.(?:m3u8|mpd)[^"]+"',
+            r'"url":"https://manifest\.[^"]+"',
+        ]:
+            m2 = re.search(pat, sd)
+            if m2:
+                return m2.group(1).replace("\\u0026", "&")
+        return """
+
     def _watch_api(self, proxy: dict | None) -> tuple[bool, int]:
         """플랫폼별 실제 API 호출 — 시청자 1명 접속
         팬더티비: POST watch (30분 토큰)
@@ -2681,8 +2720,10 @@ class BotWorker:
             kwargs_extra = {"data": body}
             session = None
         elif self.platform == "flextv":
+            # HLS m3u8 → segment 다운로드 = 실제 시청자
+            # player-count는 읽기 전용(+1 안 됨)
             cid = self._channel_id()
-            url = f"https://api.flextv.co.kr/api/channels/{cid}/stream/player-count"
+            url = f"https://api.flextv.co.kr/api/channels/{cid}/stream"
             headers = {
                 "user-agent": ua,
                 "accept": "application/json",
@@ -2693,11 +2734,13 @@ class BotWorker:
             session = requests.Session()
             session.headers.update(headers)
         else:  # youtube
+            # videoplayback(HLS)이 실제 시청자. GET /live/{id}만으로는 안 됨
             vid = self._channel_id()
             url = f"https://www.youtube.com/live/{vid}"
             headers = {
                 "user-agent": ua,
                 "accept": "text/html",
+                "accept-language": "ko-KR,ko;q=0.9,en;q=0.8",
             }
             method = "get"
             kwargs_extra = {}
@@ -2735,9 +2778,19 @@ class BotWorker:
                                 pass
                         return True, real, cs.get("host", ""), cs.get("port", 0)
                     elif self.platform == "flextv":
-                        return True, resp.json().get("data", 0), "", 0
+                        # m3u8 → segment 다운로드 = 실제 시청자
+                        seg_ok = self._download_hls(resp.text, session, **kwargs)
+                        return seg_ok, (1 if seg_ok else 0), "", 0
                     else:
-                        return True, 0, "", 0
+                        # videoplayback segment = 실제 시청자
+                        seg_url = self._extract_yt_stream(resp.text)
+                        if seg_url:
+                            try:
+                                (session or requests).get(seg_url, timeout=8, stream=True, **kwargs)
+                                return True, 1, "", 0
+                            except Exception:
+                                pass
+                        return False, 0, "", 0
             except Exception:
                 pass
         # 2) 직접 연결 fallback
@@ -2770,9 +2823,17 @@ class BotWorker:
                             pass
                     return True, real, cs.get("host", ""), cs.get("port", 0)
                 elif self.platform == "flextv":
-                    return True, resp.json().get("data", 0), "", 0
+                    seg_ok = self._download_hls(resp.text, session)
+                    return seg_ok, (1 if seg_ok else 0), "", 0
                 else:
-                    return True, 0, "", 0
+                    seg_url = self._extract_yt_stream(resp.text)
+                    if seg_url:
+                        try:
+                            requests.get(seg_url, timeout=8, stream=True)
+                            return True, 1, "", 0
+                        except Exception:
+                            pass
+                    return False, 0, "", 0
         except Exception:
             pass
         return False, 0, "", 0
