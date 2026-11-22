@@ -44,7 +44,7 @@ PLATFORMS = [
 ]
 STATUSES = ["모니터링", "일시중지", "종료"]
 CONTROL_STATUSES = ["실행", "일시중지", "종료"]
-VIEWER_PLAN_STATUSES = ["대기", "일시중지", "종료"]
+VIEWER_PLAN_STATUSES = ["대기", "가동 중", "일시중지", "종료"]
 MIN_VIEWER_COUNT = 1
 MAX_VIEWER_COUNT = 1500
 VIEWER_COUNT_STEP = 50
@@ -2210,7 +2210,7 @@ def main() -> None:
                 if not proxy_endpoint:
                     raise ValueError("프록시 주소를 입력하세요.")
                 saved = save_proxy(
-                    proxy_name,
+                    st.session_state["single_proxy_name"],
                     proxy_endpoint,
                     enabled=False,
                     source=proxy_source,
@@ -3002,6 +3002,7 @@ class BotWorker:
                     pass
             self._ws_list.clear()
             # 모든 시청자 재연결 — 각자 고정 IP 유지
+            self._connected = 0  # 재계산
             for vi in range(self.target_count):
                 if self._stop_event.is_set():
                     break
@@ -3040,7 +3041,7 @@ class BotWorker:
                 self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
-                for vi in range(self._connected, self._connected + drop):
+                for vi in range(drop):
                     if self._stop_event.is_set():
                         break
                     # 드롭아웃→재접속: 새 IP (다른 프록시)
@@ -3089,8 +3090,7 @@ def start_worker(bot_id: str, platform: str, streamer_id: str,
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
     try:
-        with connection() as conn:
-            conn.execute("UPDATE viewer_plans SET status='가동 중' WHERE id=?", (bot_id,))
+        set_viewer_plan_status(bot_id, "가동 중")
     except Exception:
         pass
     return worker
