@@ -2735,7 +2735,7 @@ class BotWorker:
             lines = [l.strip() for l in pl.text.splitlines() if l.strip() and not l.startswith("#")]
             if not lines:
                 return False
-            (session or requests).get(lines[0], timeout=8, stream=True, **kw)
+            (session or requests).get(lines[0], timeout=8, **kw)
             return True
         except Exception:
             return False
@@ -2848,7 +2848,7 @@ class BotWorker:
                         seg_url = self._extract_yt_stream(resp.text)
                         if seg_url:
                             try:
-                                (session or requests).get(seg_url, timeout=8, stream=True, **kwargs)
+                                (session or requests).get(seg_url, timeout=8, **kwargs)
                                 return True, 1, "", 0
                             except Exception:
                                 pass
@@ -2891,7 +2891,7 @@ class BotWorker:
                     seg_url = self._extract_yt_stream(resp.text)
                     if seg_url:
                         try:
-                            requests.get(seg_url, timeout=8, stream=True)
+                            requests.get(seg_url, timeout=8)
                             return True, 1, "", 0
                         except Exception:
                             pass
@@ -2985,6 +2985,9 @@ class BotWorker:
                             self._ws_list.append(ws)
                         except Exception:
                             pass
+                else:
+                    # 프록시+직접 연결 모두 실패 → 0.5초 대기 후 재시도
+                    self._stop_event.wait(0.5)
             if "채팅" in self.chat_mode and random.random() < 0.1:
                 self._send_chat()
             self._update_db(self._connected, "모니터링")
@@ -3041,7 +3044,7 @@ class BotWorker:
                 self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
-                for vi in range(drop):
+                for vi in range(self.target_count - drop, self.target_count):
                     if self._stop_event.is_set():
                         break
                     # 드롭아웃→재접속: 새 IP (다른 프록시)
