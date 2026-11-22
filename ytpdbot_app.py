@@ -1795,8 +1795,8 @@ def _autostart_workers() -> None:
     """새로고침 후에도 가동 중이던 워커 자동 재시작"""
     with connection() as conn:
         rows = conn.execute(
-            "SELECT id, platform, streamer_id, target_count, proxy_name, status "
-            "FROM active_bots WHERE status IN ('실행', '가동 중', '일시중지') "
+            "SELECT id, platform, streamer_id, viewer_count, proxy_name, status "
+            "FROM viewer_plans WHERE status IN ('대기', '일시중지') "
             "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
     for row in rows:
@@ -1805,7 +1805,7 @@ def _autostart_workers() -> None:
             _ACTIVE_WORKERS.pop(bid, None)
             start_worker(
                 bid, row["platform"], row["streamer_id"],
-                int(row["target_count"] or 0),
+                int(row["viewer_count"] or 0),
                 row["proxy_name"] or "", bid,
             )
 
@@ -2014,8 +2014,6 @@ def main() -> None:
                 )
             except ValueError as exc:
                 st.error(str(exc))
-            else:
-                st.rerun()
 
         show_completed_plans = st.checkbox("종료된 계획 표시", value=False)
         visible_viewer_plans = [
@@ -2668,6 +2666,7 @@ class BotWorker:
             }
             method = "post"
             kwargs_extra = {"data": body}
+            session = None
         elif self.platform == "flextv":
             cid = self._channel_id()
             url = f"https://api.flextv.co.kr/api/channels/{cid}/stream/player-count"
@@ -2678,8 +2677,12 @@ class BotWorker:
             }
             method = "get"
             kwargs_extra = {}
+            # 새 세션(쿠키)으로 +1
+            session = requests.Session()
+            session.headers.update(headers)
         else:  # youtube
             vid = self._channel_id()
+            # 실제 라이브 URL인지 확인
             url = f"https://www.youtube.com/live/{vid}"
             headers = {
                 "user-agent": ua,
@@ -2687,15 +2690,22 @@ class BotWorker:
             }
             method = "get"
             kwargs_extra = {}
+            session = None
 
         # 1) 프록시로 시도
         if proxy:
             try:
                 kwargs = self._requests_kwargs(proxy)
                 if method == "post":
-                    resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra, **kwargs)
+                    if session:
+                        resp = session.post(url, timeout=4, **kwargs_extra, **kwargs)
+                    else:
+                        resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra, **kwargs)
                 else:
-                    resp = requests.get(url, headers=headers, timeout=4, **kwargs)
+                    if session:
+                        resp = session.get(url, timeout=4, **kwargs)
+                    else:
+                        resp = requests.get(url, headers=headers, timeout=4, **kwargs)
                 if resp.status_code == 200:
                     if self.platform == "pandatv":
                         return True, resp.json().get("media", {}).get("user", 0)
@@ -2708,9 +2718,15 @@ class BotWorker:
         # 2) 직접 연결 fallback
         try:
             if method == "post":
-                resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra)
+                if session:
+                    resp = session.post(url, timeout=4, **kwargs_extra)
+                else:
+                    resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra)
             else:
-                resp = requests.get(url, headers=headers, timeout=4)
+                if session:
+                    resp = session.get(url, timeout=4)
+                else:
+                    resp = requests.get(url, headers=headers, timeout=4)
             if resp.status_code == 200:
                 if self.platform == "pandatv":
                     return True, resp.json().get("media", {}).get("user", 0)
