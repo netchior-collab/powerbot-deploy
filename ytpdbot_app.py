@@ -2598,7 +2598,7 @@ class BotWorker:
     def _proxies(self) -> list[dict]:
         with connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
+                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 AND endpoint LIKE 'http://%' ORDER BY latency_ms ASC"
             ).fetchall()
             return [dict(r) for r in rows]
 
