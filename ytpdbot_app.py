@@ -2659,7 +2659,8 @@ class BotWorker:
 
         if self.platform == "pandatv":
             cid = self._channel_id()
-            body = f"userId={cid}&action=watch"
+            uid = f"bot{random.randint(100000000, 999999999)}"
+            body = f"userId={uid}&action=watch"
             url = "https://api.pandalive.co.kr/v1/live/play"
             headers = {
                 "x-device-info": '{"t":"webPc","v":"1.0","ui":"0","ck":{"sessKeyAsp":""}}',
@@ -2884,11 +2885,11 @@ class BotWorker:
                         self._connected += 1
                         self._update_db(real_count, "가동 중")
                     time.sleep(delay)
-            self._stop_event.wait(30)
+                self._stop_event.wait(30)
                 proxy = self._pick_proxy()
-                ok, real_count = self._watch_api(proxy)
+                ok, real_count, _, _ = self._watch_api(proxy)
                 if not ok:
-                    ok, real_count = self._watch_api(None)
+                    ok, real_count, _, _ = self._watch_api(None)
                 if ok:
                     self._update_db(real_count, "가동 중")
                 time.sleep(delay)
