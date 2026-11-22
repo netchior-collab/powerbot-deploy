@@ -44,9 +44,9 @@ PLATFORMS = [
 STATUSES = ["모니터링", "일시중지", "종료"]
 CONTROL_STATUSES = ["실행", "일시중지", "종료"]
 VIEWER_PLAN_STATUSES = ["대기", "일시중지", "종료"]
-MIN_VIEWER_COUNT = 20
+MIN_VIEWER_COUNT = 1
 MAX_VIEWER_COUNT = 1500
-VIEWER_COUNT_STEP = 10
+VIEWER_COUNT_STEP = 50
 PARTNER_LIMIT = 2000
 PARTNER_LIMITS = {"사장님(나)": PARTNER_LIMIT}
 MOTION_TYPES = [
@@ -2662,8 +2662,7 @@ class BotWorker:
 
         if self.platform == "pandatv":
             cid = self._channel_id()
-            uid = f"bot{random.randint(100000000, 999999999)}"
-            body = f"userId={uid}&action=watch"
+            body = f"userId={cid}&action=watch"
             url = "https://api.pandalive.co.kr/v1/live/play"
             headers = {
                 "x-device-info": '{"t":"webPc","v":"1.0","ui":"0","ck":{"sessKeyAsp":""}}',
@@ -2715,7 +2714,7 @@ class BotWorker:
                 if resp.status_code == 200 and resp.text:
                     if self.platform == "pandatv":
                         d = resp.json()
-                        cs = d.get("chatServer", {})
+                        cs = d.get("media", {}).get("chatServer", {})
                         return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
                     elif self.platform == "flextv":
                         return True, resp.json().get("data", 0), "", 0
@@ -2738,7 +2737,7 @@ class BotWorker:
             if resp.status_code == 200 and resp.text:
                 if self.platform == "pandatv":
                     d = resp.json()
-                    cs = d.get("chatServer", {})
+                    cs = d.get("media", {}).get("chatServer", {})
                     return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
                 elif self.platform == "flextv":
                     return True, resp.json().get("data", 0), "", 0
@@ -2811,10 +2810,8 @@ class BotWorker:
             if ok:
                 self._connected += 1
                 self._update_db(real_count, "모니터링")
-                # WebSocket 연결 (팬더티비만)
                 if self.platform == "pandatv" and chat_host:
                     try:
-                        import websocket
                         ws = websocket.WebSocket()
                         ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
                         ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
@@ -2828,7 +2825,6 @@ class BotWorker:
                     self._update_db(real_count, "모니터링")
                     if self.platform == "pandatv" and chat_host:
                         try:
-                            import websocket
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
                             ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
@@ -2838,28 +2834,30 @@ class BotWorker:
             if "채팅" in self.chat_mode and random.random() < 0.1:
                 self._send_chat()
             time.sleep(delay)
-        # ② 유지 루프 — 1분마다 action=watch로 세션 갱신 + WebSocket 유지
-        # ③ 유지 루프 — 30초마다 10% 시청자 세션 갱신 (viewer 유지)
+        # ② 유지 루프 — 55초마다 모든 WS 끊고 다시 연결
         tick = 0
         while not self._stop_event.is_set():
+            if self._stop_event.wait(55):
+                break
             tick += 1
-            # WebSocket ping
-            for ws in self._ws_list[:]:
+            # 모든 WS 닫기
+            for ws in self._ws_list:
                 try:
-                    ws.send(json.dumps({"cmd":"ping"}))
+                    ws.close()
                 except Exception:
-                    self._ws_list.remove(ws)
-            # 30초마다 10% 시청자 갱신 (action=watch로 세션 유지)
-            if tick % 1 == 0:
-                refresh = max(1, self.target_count // 10)
-                for _ in range(refresh):
-                    if self._stop_event.is_set():
-                        break
-                    proxy = self._pick_proxy()
-                    ok, real_count, chat_host, chat_port = self._watch_api(proxy)
-                    if not ok:
-                        ok, real_count, chat_host, chat_port = self._watch_api(None)
-                    if ok and self.platform == "pandatv" and chat_host:
+                    pass
+            self._ws_list.clear()
+            # 모든 시청자 재연결 (play + WS)
+            for _ in range(self.target_count):
+                if self._stop_event.is_set():
+                    break
+                proxy = self._pick_proxy()
+                ok, real_count, chat_host, chat_port = self._watch_api(proxy)
+                if not ok:
+                    ok, real_count, chat_host, chat_port = self._watch_api(None)
+                if ok:
+                    self._connected += 1
+                    if self.platform == "pandatv" and chat_host:
                         try:
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
@@ -2867,13 +2865,22 @@ class BotWorker:
                             self._ws_list.append(ws)
                         except Exception:
                             pass
+                    self._update_db(real_count, "모니터링")
                     time.sleep(delay)
-            self._update_db(self._connected, "모니터링")
             # 25분마다 일부 이탈 후 재접속
-            if tick % 50 == 0:
+            if tick % 27 == 0:
                 drop = random.randint(1, max(2, self.target_count // 10))
-                self._connected = max(0, self.target_count - drop)
-                self._update_db(self._connected, "일시중지")
+                for _ in range(drop):
+                    if self._stop_event.is_set():
+                        break
+                    ws = self._ws_list.pop() if self._ws_list else None
+                    if ws:
+                        try: ws.send(json.dumps({"cmd":"leave","userId":""}))
+                        except Exception: pass
+                        try: ws.close()
+                        except Exception: pass
+                    self._connected -= 1
+                    self._update_db(self._connected, "일시중지")
                 self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
@@ -2881,21 +2888,21 @@ class BotWorker:
                     if self._stop_event.is_set():
                         break
                     proxy = self._pick_proxy()
-                    ok, real_count, _, _ = self._watch_api(proxy)
+                    ok, real_count, chat_host, chat_port = self._watch_api(proxy)
                     if not ok:
-                        ok, real_count, _, _ = self._watch_api(None)
+                        ok, real_count, chat_host, chat_port = self._watch_api(None)
                     if ok:
                         self._connected += 1
+                        if self.platform == "pandatv" and chat_host:
+                            try:
+                                ws = websocket.WebSocket()
+                                ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
+                                ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
+                                self._ws_list.append(ws)
+                            except Exception:
+                                pass
                         self._update_db(real_count, "모니터링")
-                    time.sleep(delay)
-                self._stop_event.wait(30)
-                proxy = self._pick_proxy()
-                ok, real_count, _, _ = self._watch_api(proxy)
-                if not ok:
-                    ok, real_count, _, _ = self._watch_api(None)
-                if ok:
-                    self._update_db(real_count, "모니터링")
-                time.sleep(delay)
+                        time.sleep(delay)
         self._update_db(self._connected, "종료")
 
     def stop(self) -> None:
@@ -2921,6 +2928,7 @@ def start_worker(bot_id: str, platform: str, streamer_id: str,
     _ACTIVE_WORKERS[bot_id] = worker
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
+    threading.Thread(target=worker.run, daemon=True).start()
     return worker
 
 
@@ -2928,6 +2936,11 @@ def stop_worker(bot_id: str) -> None:
     worker = _ACTIVE_WORKERS.pop(bot_id, None)
     if worker:
         worker.stop()
+    try:
+        with connection() as conn:
+            conn.execute("UPDATE viewer_plans SET status='종료' WHERE id=?", (bot_id,))
+    except Exception:
+        pass
 
 
 def render_dashboard():
