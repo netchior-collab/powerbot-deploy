@@ -1801,15 +1801,18 @@ def _autostart_workers() -> None:
             "FROM viewer_plans WHERE status IN ('대기', '일시중지') "
             "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
-    for row in rows:
-        bid = row["id"]
-        if bid not in _ACTIVE_WORKERS or not _ACTIVE_WORKERS[bid].running:
-            _ACTIVE_WORKERS.pop(bid, None)
-            start_worker(
-                bid, row["platform"], row["streamer_id"],
-                int(row["viewer_count"] or 0),
-                "", bid,
-            )
+    try:
+        for row in rows:
+            bid = row["id"]
+            if bid not in _ACTIVE_WORKERS or not _ACTIVE_WORKERS[bid].running:
+                _ACTIVE_WORKERS.pop(bid, None)
+                start_worker(
+                    bid, row["platform"], row["streamer_id"],
+                    int(row["viewer_count"] or 0),
+                    "", bid,
+                )
+    except Exception as e:
+        print(f"[autostart] error: {e}")
 
 
 def main() -> None:
