@@ -426,7 +426,7 @@ def init_db() -> None:
                 platform TEXT NOT NULL,
                 streamer_id TEXT NOT NULL,
                 plan_name TEXT NOT NULL,
-                viewer_count INTEGER NOT NULL CHECK(viewer_count BETWEEN 20 AND 1500),
+                viewer_count INTEGER NOT NULL CHECK(viewer_count BETWEEN 1 AND 1500),
                 operator TEXT NOT NULL DEFAULT '사장님(나)',
                 motion_type TEXT NOT NULL DEFAULT '자연스럽게 서서히 증가/감소 (추천)',
                 chat_mode TEXT NOT NULL DEFAULT '채팅 시스템 비활성화',
@@ -2603,7 +2603,7 @@ class BotWorker:
     def _proxies(self) -> list[dict]:
         with connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
+                "SELECT * FROM proxy_settings WHERE enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -2703,14 +2703,14 @@ class BotWorker:
                 kwargs = self._requests_kwargs(proxy)
                 if method == "post":
                     if session:
-                        resp = session.post(url, timeout=4, **kwargs_extra, **kwargs)
+                        resp = session.post(url, timeout=8, **kwargs_extra, **kwargs)
                     else:
-                        resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra, **kwargs)
+                        resp = requests.post(url, headers=headers, timeout=8, **kwargs_extra, **kwargs)
                 else:
                     if session:
-                        resp = session.get(url, timeout=4, **kwargs)
+                        resp = session.get(url, timeout=8, **kwargs)
                     else:
-                        resp = requests.get(url, headers=headers, timeout=4, **kwargs)
+                        resp = requests.get(url, headers=headers, timeout=8, **kwargs)
                 if resp.status_code == 200 and resp.text:
                     if self.platform == "pandatv":
                         d = resp.json()
@@ -2726,14 +2726,14 @@ class BotWorker:
         try:
             if method == "post":
                 if session:
-                    resp = session.post(url, timeout=4, **kwargs_extra)
+                    resp = session.post(url, timeout=8, **kwargs_extra)
                 else:
-                    resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra)
+                    resp = requests.post(url, headers=headers, timeout=8, **kwargs_extra)
             else:
                 if session:
-                    resp = session.get(url, timeout=4)
+                    resp = session.get(url, timeout=8)
                 else:
-                    resp = requests.get(url, headers=headers, timeout=4)
+                    resp = requests.get(url, headers=headers, timeout=8)
             if resp.status_code == 200 and resp.text:
                 if self.platform == "pandatv":
                     d = resp.json()
@@ -2928,7 +2928,6 @@ def start_worker(bot_id: str, platform: str, streamer_id: str,
     _ACTIVE_WORKERS[bot_id] = worker
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
-    threading.Thread(target=worker.run, daemon=True).start()
     return worker
 
 
