@@ -1867,8 +1867,9 @@ def _autostart_workers() -> None:
     """새로고침 후에도 가동 중이던 워커 자동 재시작"""
     with connection() as conn:
         rows = conn.execute(
-            "SELECT id, platform, streamer_id, viewer_count, status "
-            "FROM viewer_plans WHERE status IN ('대기', '가동 중', '일시중지') "
+            "SELECT id, platform, streamer_id, viewer_count, status, "
+            "motion_type, chat_mode "
+            "FROM viewer_plans WHERE status='가동 중' "
             "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
     try:
@@ -1880,6 +1881,7 @@ def _autostart_workers() -> None:
                     bid, row["platform"], row["streamer_id"],
                     int(row["viewer_count"] or 0),
                     "", bid,
+                    row.get("motion_type") or "", row.get("chat_mode") or "자연 채팅",
                 )
     except Exception as e:
         print(f"[autostart] error: {e}")
@@ -3045,7 +3047,8 @@ class BotWorker:
                         except Exception:
                             pass
                     self._update_db(real_count, "모니터링")
-                    time.sleep(delay)
+                    if not self._stop_event.wait(delay):
+                        continue
             # 25분마다 일부 이탈 후 재접속
             if tick % 27 == 0:
                 drop = random.randint(1, max(2, self.target_count // 10))
