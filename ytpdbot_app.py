@@ -2798,7 +2798,7 @@ class BotWorker:
 
     def run(self) -> None:
         self._connected = 0
-        self._update_db(0, "가동 중")
+        self._update_db(0, "모니터링")
         # 프록시가 없으면 자동 수집
         if not self._proxies():
             collect_and_verify_proxies()
@@ -2810,7 +2810,7 @@ class BotWorker:
             ok, real_count, chat_host, chat_port = self._watch_api(proxy)
             if ok:
                 self._connected += 1
-                self._update_db(real_count, "가동 중")
+                self._update_db(real_count, "모니터링")
                 # WebSocket 연결 (팬더티비만)
                 if self.platform == "pandatv" and chat_host:
                     try:
@@ -2825,7 +2825,7 @@ class BotWorker:
                 ok, real_count, chat_host, chat_port = self._watch_api(None)
                 if ok:
                     self._connected += 1
-                    self._update_db(real_count, "가동 중")
+                    self._update_db(real_count, "모니터링")
                     if self.platform == "pandatv" and chat_host:
                         try:
                             import websocket
@@ -2868,7 +2868,7 @@ class BotWorker:
                         except Exception:
                             pass
                     time.sleep(delay)
-            self._update_db(self._connected, "가동 중")
+            self._update_db(self._connected, "모니터링")
             # 25분마다 일부 이탈 후 재접속
             if tick % 50 == 0:
                 drop = random.randint(1, max(2, self.target_count // 10))
@@ -2886,7 +2886,7 @@ class BotWorker:
                         ok, real_count, _, _ = self._watch_api(None)
                     if ok:
                         self._connected += 1
-                        self._update_db(real_count, "가동 중")
+                        self._update_db(real_count, "모니터링")
                     time.sleep(delay)
                 self._stop_event.wait(30)
                 proxy = self._pick_proxy()
@@ -2894,7 +2894,7 @@ class BotWorker:
                 if not ok:
                     ok, real_count, _, _ = self._watch_api(None)
                 if ok:
-                    self._update_db(real_count, "가동 중")
+                    self._update_db(real_count, "모니터링")
                 time.sleep(delay)
         self._update_db(self._connected, "종료")
 
