@@ -1797,7 +1797,7 @@ def _autostart_workers() -> None:
     """새로고침 후에도 가동 중이던 워커 자동 재시작"""
     with connection() as conn:
         rows = conn.execute(
-            "SELECT id, platform, streamer_id, viewer_count, proxy_name, status "
+            "SELECT id, platform, streamer_id, viewer_count, status "
             "FROM viewer_plans WHERE status IN ('대기', '일시중지') "
             "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
@@ -1808,7 +1808,7 @@ def _autostart_workers() -> None:
             start_worker(
                 bid, row["platform"], row["streamer_id"],
                 int(row["viewer_count"] or 0),
-                row["proxy_name"] or "", bid,
+                "", bid,
             )
 
 
