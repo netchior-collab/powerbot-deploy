@@ -2668,11 +2668,17 @@ class BotWorker:
         return not self._stop_event.is_set()
 
     def _proxies(self) -> list[dict]:
+        import time as _t
+        if self._proxy_cache is not None and _t.time() - self._proxy_cache_time < 30:
+            return self._proxy_cache
         with connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM proxy_settings WHERE enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
             ).fetchall()
-            return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        self._proxy_cache = result
+        self._proxy_cache_time = _t.time()
+        return result
 
     def _pick_proxy(self, viewer_idx: int = -1, failed_endpoint: str = "") -> dict | None:
         pool = self._proxies()
