@@ -794,7 +794,11 @@ def _discard_failed_proxy(name: str, *, pause_dependents: bool) -> list[str]:
             (name,),
         ).fetchall()
         bot_ids = [bot["id"] for bot in affected_bots]
-        conn.execute("DELETE FROM proxy_settings WHERE name=?", (name,))
+        conn.execute(
+            "UPDATE proxy_settings SET enabled=0, quarantined=1, "
+            "health_status='오류', updated_at=? WHERE name=?",
+            (timestamp, name),
+        )
         if pause_dependents:
             for bot_id in bot_ids:
                 conn.execute(
