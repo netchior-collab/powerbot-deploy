@@ -197,6 +197,36 @@ PUBLIC_PROXY_SOURCE_CATALOG = [
             ("socks5", "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt"),
         ],
     },
+    {
+        # 60초마다 자동 검증 (Hydra) — 최고 품질, uptime/stability 데이터 포함
+        "name": "Stormsia / proxy-list (60s 검증)",
+        "repository": "https://github.com/stormsia/proxy-list",
+        "json_feed": True,
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/stormsia/proxy-list/main/data/proxies.json"),
+            ("socks5", "https://raw.githubusercontent.com/stormsia/proxy-list/main/data/proxies.json"),
+        ],
+    },
+    {
+        # 30분마다 업데이트
+        "name": "ProxyScraper (30분 업데이트)",
+        "repository": "https://github.com/proxyscraper/ProxyScraper",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/proxyscraper/ProxyScraper/master/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/proxyscraper/ProxyScraper/master/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/proxyscraper/ProxyScraper/master/socks5.txt"),
+        ],
+    },
+    {
+        # 1시간마다 업데이트
+        "name": "ShiftyTR / Proxy-List (1시간 업데이트)",
+        "repository": "https://github.com/ShiftyTR/Proxy-List",
+        "feeds": [
+            ("http", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"),
+            ("socks4", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt"),
+            ("socks5", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt"),
+        ],
+    },
 ]
 PUBLIC_PROXY_SOURCES = [
     feed
@@ -205,7 +235,7 @@ PUBLIC_PROXY_SOURCES = [
 ]
 MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
-MAX_PUBLIC_PROXY_COLLECT = 5000
+MAX_PUBLIC_PROXY_COLLECT = 10000
 MAX_PUBLIC_PROXY_WORKERS = 50
 UI_PUBLIC_PROXY_COLLECT = 500
 UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 4.0
@@ -1131,9 +1161,12 @@ def collect_and_verify_proxies(
     candidates: list[str] = []
     seen: set[str] = set()
     source_failures = 0
-    source_count = max(1, len(PUBLIC_PROXY_SOURCES))
+    source_count = max(1, len(PUBLIC_PROXY_SOURCE_CATALOG))
     per_source_limit = max(1, (int(max_collect) + source_count - 1) // source_count)
-    for default_scheme, source_url in PUBLIC_PROXY_SOURCES:
+    for source in PUBLIC_PROXY_SOURCE_CATALOG:
+        default_scheme = source["feeds"][0][0]
+        source_url = source["feeds"][0][1]
+        is_json = source.get("json_feed", False)
         try:
             request = urllib.request.Request(
                 source_url,
@@ -1143,35 +1176,58 @@ def collect_and_verify_proxies(
                 request, timeout=fetch_timeout_seconds
             ) as response:
                 payload = response.read(MAX_PROXY_IMPORT_BYTES)
-            # Some maintained feeds contain hundreds of thousands of rows. A
-            # bounded prefix is enough because each source has a fair quota;
-            # discard only the possibly truncated final row instead of
-            # rejecting the entire source for being larger than 1 MiB.
-            if len(payload) == MAX_PROXY_IMPORT_BYTES and b"\n" in payload:
-                payload = payload.rsplit(b"\n", 1)[0]
-            lines = payload.decode("utf-8", errors="ignore").splitlines()
         except (OSError, ValueError):
             source_failures += 1
             continue
 
         source_added = 0
-        for raw_line in lines:
-            candidate = raw_line.strip().lstrip("\ufeff")
-            if not candidate or candidate.startswith("#"):
-                continue
-            if "://" not in candidate:
-                candidate = f"{default_scheme}://{candidate}"
+        if is_json:
             try:
-                endpoint = normalize_proxy_endpoint(candidate)
-            except ValueError:
+                data = json.loads(payload.decode("utf-8", errors="ignore"))
+            except (ValueError, OSError):
+                source_failures += 1
                 continue
-            if endpoint in seen:
-                continue
-            seen.add(endpoint)
-            candidates.append(endpoint)
-            source_added += 1
-            if source_added >= per_source_limit or len(candidates) >= max_collect:
-                break
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                proto = item.get("protocol", "http").lower()
+                ip = item.get("ip", "")
+                port = item.get("port", 0)
+                if not ip or not port:
+                    continue
+                candidate = f"{proto}://{ip}:{port}"
+                try:
+                    endpoint = normalize_proxy_endpoint(candidate)
+                except ValueError:
+                    continue
+                if endpoint in seen:
+                    continue
+                seen.add(endpoint)
+                candidates.append(endpoint)
+                source_added += 1
+                if source_added >= per_source_limit or len(candidates) >= max_collect:
+                    break
+        else:
+            if len(payload) == MAX_PROXY_IMPORT_BYTES and b"\n" in payload:
+                payload = payload.rsplit(b"\n", 1)[0]
+            lines = payload.decode("utf-8", errors="ignore").splitlines()
+            for raw_line in lines:
+                candidate = raw_line.strip().lstrip("\ufeff")
+                if not candidate or candidate.startswith("#"):
+                    continue
+                if "://" not in candidate:
+                    candidate = f"{default_scheme}://{candidate}"
+                try:
+                    endpoint = normalize_proxy_endpoint(candidate)
+                except ValueError:
+                    continue
+                if endpoint in seen:
+                    continue
+                seen.add(endpoint)
+                candidates.append(endpoint)
+                source_added += 1
+                if source_added >= per_source_limit or len(candidates) >= max_collect:
+                    break
 
     def probe(endpoint: str) -> tuple[str, bool]:
         try:
