@@ -2602,6 +2602,7 @@ class BotWorker:
         self._stop_event = threading.Event()
         self._connected = 0
         self._ws_list = []  # WebSocket 연결 목록
+        self._viewer_proxies = {}  # 시청자 인덱스 → 프록시 (고정 IP)
 
     @property
     def running(self) -> bool:
@@ -2614,7 +2615,7 @@ class BotWorker:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def _pick_proxy(self, failed_endpoint: str = "") -> dict | None:
+    def _pick_proxy(self, viewer_idx: int = -1, failed_endpoint: str = "") -> dict | None:
         pool = self._proxies()
         if not pool:
             return None
@@ -2622,19 +2623,23 @@ class BotWorker:
             for p in pool:
                 if p["name"] == self.proxy_name:
                     return p
-        # 안 쓴 프록시를 순서대로 — 444(IP 제한) 방지
-        if not hasattr(self, "_used_proxies"):
-            self._used_proxies = set()
-        # 444 감지 → 실패한 프록시 제외
-        unused = [p for p in pool if p["endpoint"] not in self._used_proxies and p["endpoint"] != failed_endpoint]
-        if unused:
-            chosen = unused[0]
-            self._used_proxies.add(chosen["endpoint"])
-            return chosen
-        # 모든 프록시 사용됨 → 초기화 후 처음으로
-        self._used_proxies.clear()
-        chosen = pool[0] if pool[0]["endpoint"] != failed_endpoint else (pool[1] if len(pool) > 1 else pool[0])
-        self._used_proxies.add(chosen["endpoint"])
+        # 시청자별 고정 IP — 매번 같은 프록시 사용
+        if viewer_idx >= 0 and viewer_idx in self._viewer_proxies:
+            stored = self._viewer_proxies[viewer_idx]
+            # 저장된 프록시가 pool에 있고 실패한 프록시가 아니면 그대로 사용
+            if stored["endpoint"] not in [p["endpoint"] for p in pool]:
+                pass  # pool에 없으면 새 프록시 할당
+            elif stored["endpoint"] == failed_endpoint:
+                pass  # 실패한 프록시 → 새 프록시
+            else:
+                return stored
+        # 새 프록시 할당 — 라운드 로빈 (시청자 순번 = 프록시 순번)
+        idx = viewer_idx % len(pool) if viewer_idx >= 0 else 0
+        chosen = pool[idx]
+        if failed_endpoint and chosen["endpoint"] == failed_endpoint:
+            chosen = pool[(idx + 1) % len(pool)]
+        if viewer_idx >= 0:
+            self._viewer_proxies[viewer_idx] = chosen
         return chosen
 
     def _requests_kwargs(self, proxy: dict | None) -> dict:
@@ -2897,7 +2902,7 @@ class BotWorker:
         # ① 목표 인원까지 실제 API로 1명씩 접속
         #    각 시청자를 다른 프록시로 (444 IP 제한 방지)
         while self._connected < self.target_count and not self._stop_event.is_set():
-            proxy = self._pick_proxy()
+            proxy = self._pick_proxy(viewer_idx=self._connected)
             ok, real_count, chat_host, chat_port = self._watch_api(proxy)
             if ok:
                 self._connected += 1
@@ -2910,7 +2915,9 @@ class BotWorker:
                     except Exception:
                         pass
             else:
-                ok, real_count, chat_host, chat_port = self._watch_api(None)
+                # 444 → 새 프록시로 재시도
+                proxy2 = self._pick_proxy(viewer_idx=self._connected, failed_endpoint=proxy["endpoint"] if proxy else "")
+                ok, real_count, chat_host, chat_port = self._watch_api(proxy2)
                 if ok:
                     self._connected += 1
                     self._update_db(real_count, "모니터링")
@@ -2938,14 +2945,16 @@ class BotWorker:
                 except Exception:
                     pass
             self._ws_list.clear()
-            # 모든 시청자 재연결 (play + WS)
-            for _ in range(self.target_count):
+            # 모든 시청자 재연결 — 각자 고정 IP 유지
+            for vi in range(self.target_count):
                 if self._stop_event.is_set():
                     break
-                proxy = self._pick_proxy()
+                proxy = self._pick_proxy(viewer_idx=vi)
                 ok, real_count, chat_host, chat_port = self._watch_api(proxy)
-                if not ok:
-                    ok, real_count, chat_host, chat_port = self._watch_api(None)
+                if not ok and proxy:
+                    # 444 → 새 IP로 재시도
+                    proxy = self._pick_proxy(viewer_idx=vi, failed_endpoint=proxy["endpoint"])
+                    ok, real_count, chat_host, chat_port = self._watch_api(proxy)
                 if ok:
                     self._connected += 1
                     if self.platform == "pandatv" and chat_host:
@@ -2975,13 +2984,16 @@ class BotWorker:
                 self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
-                for _ in range(drop):
+                for vi in range(self._connected, self._connected + drop):
                     if self._stop_event.is_set():
                         break
-                    proxy = self._pick_proxy()
+                    # 드롭아웃→재접속: 새 IP (다른 프록시)
+                    self._viewer_proxies.pop(vi, None)
+                    proxy = self._pick_proxy(viewer_idx=vi)
                     ok, real_count, chat_host, chat_port = self._watch_api(proxy)
-                    if not ok:
-                        ok, real_count, chat_host, chat_port = self._watch_api(None)
+                    if not ok and proxy:
+                        proxy = self._pick_proxy(viewer_idx=vi, failed_endpoint=proxy["endpoint"])
+                        ok, real_count, chat_host, chat_port = self._watch_api(proxy)
                     if ok:
                         self._connected += 1
                         if self.platform == "pandatv" and chat_host:
@@ -3004,6 +3016,7 @@ class BotWorker:
             except Exception:
                 pass
         self._ws_list.clear()
+        self._viewer_proxies.clear()
 
 
 _ACTIVE_WORKERS: dict[str, BotWorker] = {}
