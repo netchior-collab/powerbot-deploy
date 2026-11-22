@@ -211,15 +211,15 @@ UI_PUBLIC_PROXY_COLLECT = 500
 UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 4.0
 UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.5
 UI_PROXY_POOL_TIMEOUT_SECONDS = 3.5
-UI_PROXY_POOL_CANDIDATES = 60
-UI_PROXY_POOL_WORKERS = 30
+UI_PROXY_POOL_CANDIDATES = 300
+UI_PROXY_POOL_WORKERS = 60
 PROXY_INVENTORY_DISPLAY_LIMIT = 100
 PROXY_INVENTORY_CONTROL_LIMIT = 20
 MAX_PROXY_FAILOVER_CANDIDATES = 40
 MAX_PROXY_FAILOVER_WORKERS = 10
-MAX_VERIFIED_PROXY_POOL = 10
-MAX_PROXY_POOL_CANDIDATES = 100
-MAX_PROXY_POOL_WORKERS = 20
+MAX_VERIFIED_PROXY_POOL = 100
+MAX_PROXY_POOL_CANDIDATES = 300
+MAX_PROXY_POOL_WORKERS = 60
 PROXY_EGRESS_CHECK_URL = "https://api.ipify.org?format=json"
 DB_PATH = Path(os.getenv("YTPDBOT_DB_PATH", str(Path(__file__).with_name("broadcast_ops.db")))).expanduser()
 MAX_IDENTIFIER_LENGTH = 100
@@ -2614,25 +2614,26 @@ class BotWorker:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def _pick_proxy(self) -> dict | None:
+    def _pick_proxy(self, failed_endpoint: str = "") -> dict | None:
         pool = self._proxies()
         if not pool:
             return None
-        if self.proxy_name:
+        if self.proxy_name and not failed_endpoint:
             for p in pool:
                 if p["name"] == self.proxy_name:
                     return p
         # 안 쓴 프록시를 순서대로 — 444(IP 제한) 방지
         if not hasattr(self, "_used_proxies"):
             self._used_proxies = set()
-        unused = [p for p in pool if p["endpoint"] not in self._used_proxies]
+        # 444 감지 → 실패한 프록시 제외
+        unused = [p for p in pool if p["endpoint"] not in self._used_proxies and p["endpoint"] != failed_endpoint]
         if unused:
             chosen = unused[0]
             self._used_proxies.add(chosen["endpoint"])
             return chosen
         # 모든 프록시 사용됨 → 초기화 후 처음으로
         self._used_proxies.clear()
-        chosen = pool[0]
+        chosen = pool[0] if pool[0]["endpoint"] != failed_endpoint else (pool[1] if len(pool) > 1 else pool[0])
         self._used_proxies.add(chosen["endpoint"])
         return chosen
 
@@ -2695,7 +2696,7 @@ class BotWorker:
             m2 = re.search(pat, sd)
             if m2:
                 return m2.group(1).replace("\\u0026", "&")
-        return """
+        return ""
 
     def _watch_api(self, proxy: dict | None) -> tuple[bool, int]:
         """플랫폼별 실제 API 호출 — 시청자 1명 접속
