@@ -2817,7 +2817,7 @@ class BotWorker:
                         import websocket
                         ws = websocket.WebSocket()
                         ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
-                        ws.send(json.dumps({"cmd":"enter","userId":self._channel_id()}))
+                        ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
                         self._ws_list.append(ws)
                     except Exception:
                         pass
@@ -2831,7 +2831,7 @@ class BotWorker:
                             import websocket
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
-                            ws.send(json.dumps({"cmd":"enter","userId":self._channel_id()}))
+                            ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
                             self._ws_list.append(ws)
                         except Exception:
                             pass
@@ -2863,7 +2863,7 @@ class BotWorker:
                         try:
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
-                            ws.send(json.dumps({"cmd":"enter","userId":self._channel_id()}))
+                            ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
                             self._ws_list.append(ws)
                         except Exception:
                             pass
