@@ -2835,67 +2835,56 @@ class BotWorker:
                 self._send_chat()
             time.sleep(delay)
         # ② 유지 루프 — 1분마다 action=watch로 세션 갱신 + WebSocket 유지
+        # ③ 유지 루프 — 30초마다 10% 시청자 세션 갱신 (viewer 유지)
+        tick = 0
         while not self._stop_event.is_set():
-            # WebSocket ping 유지
+            tick += 1
+            # WebSocket ping
             for ws in self._ws_list[:]:
                 try:
                     ws.send(json.dumps({"cmd":"ping"}))
                 except Exception:
                     self._ws_list.remove(ws)
-            # 1분마다 10%의 시청자 세션 갱신
-            refresh = max(1, self.target_count // 10)
-            for _ in range(refresh):
-                if self._stop_event.is_set():
-                    break
-                proxy = self._pick_proxy()
-                ok, real_count, chat_host, chat_port = self._watch_api(proxy)
-                if ok:
-                    if self.platform == "pandatv" and chat_host:
-                        try:
-                            import websocket
-                            ws = websocket.WebSocket()
-                            ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
-                            ws.send(json.dumps({"cmd":"enter","userId":self._channel_id()}))
-                            self._ws_list.append(ws)
-                        except Exception:
-                            pass
-                else:
-                    ok, real_count, chat_host, chat_port = self._watch_api(None)
+            # 30초마다 10% 시청자 갱신 (action=watch로 세션 유지)
+            if tick % 1 == 0:
+                refresh = max(1, self.target_count // 10)
+                for _ in range(refresh):
+                    if self._stop_event.is_set():
+                        break
+                    proxy = self._pick_proxy()
+                    ok, real_count, chat_host, chat_port = self._watch_api(proxy)
+                    if not ok:
+                        ok, real_count, chat_host, chat_port = self._watch_api(None)
                     if ok and self.platform == "pandatv" and chat_host:
                         try:
-                            import websocket
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
                             ws.send(json.dumps({"cmd":"enter","userId":self._channel_id()}))
                             self._ws_list.append(ws)
                         except Exception:
                             pass
-                time.sleep(delay)
+                    time.sleep(delay)
             self._update_db(self._connected, "가동 중")
-            # 25분마다 일부 이탈 후 재접속 (자연스러운 변동)
-            self._stop_event.wait(24 * 60)
-            if self._stop_event.is_set():
-                break
-            drop = random.randint(1, max(2, self.target_count // 10))
-            self._connected = max(0, self.target_count - drop)
-            self._update_db(self._connected, "일시중지")
-            self._stop_event.wait(random.uniform(3, 8))
-            if self._stop_event.is_set():
-                break
-            for _ in range(drop):
+            # 25분마다 일부 이탈 후 재접속
+            if tick % 50 == 0:
+                drop = random.randint(1, max(2, self.target_count // 10))
+                self._connected = max(0, self.target_count - drop)
+                self._update_db(self._connected, "일시중지")
+                self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
-                proxy = self._pick_proxy()
-                ok, real_count, _, _ = self._watch_api(proxy)
-                if not ok:
-                    ok, real_count, _, _ = self._watch_api(None)
-                if ok:
-                    self._connected += 1
-                    self._update_db(real_count, "가동 중")
-                time.sleep(delay)
-            for _ in range(self.target_count - drop):
-                if self._stop_event.is_set():
-                    break
+                for _ in range(drop):
+                    if self._stop_event.is_set():
+                        break
+                    proxy = self._pick_proxy()
+                    ok, real_count, _, _ = self._watch_api(proxy)
+                    if not ok:
+                        ok, real_count, _, _ = self._watch_api(None)
+                    if ok:
+                        self._connected += 1
+                        self._update_db(real_count, "가동 중")
+                    time.sleep(delay)
+            self._stop_event.wait(30)
                 proxy = self._pick_proxy()
                 ok, real_count = self._watch_api(proxy)
                 if not ok:
