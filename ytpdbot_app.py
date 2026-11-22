@@ -430,7 +430,7 @@ def init_db() -> None:
                 operator TEXT NOT NULL DEFAULT '사장님(나)',
                 motion_type TEXT NOT NULL DEFAULT '자연스럽게 서서히 증가/감소 (추천)',
                 chat_mode TEXT NOT NULL DEFAULT '채팅 시스템 비활성화',
-                status TEXT NOT NULL CHECK(status IN ('대기', '일시중지', '종료')),
+                status TEXT NOT NULL CHECK(status IN ('대기', '가동 중', '일시중지', '종료')),
                 notes TEXT NOT NULL DEFAULT '',
                 duration_hours INTEGER NOT NULL DEFAULT 2,
                 current_count INTEGER NOT NULL DEFAULT 0,
@@ -1798,7 +1798,7 @@ def _autostart_workers() -> None:
     with connection() as conn:
         rows = conn.execute(
             "SELECT id, platform, streamer_id, viewer_count, status "
-            "FROM viewer_plans WHERE status IN ('대기', '일시중지') "
+            "FROM viewer_plans WHERE status IN ('대기', '가동 중', '일시중지') "
             "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
     try:
@@ -2928,6 +2928,11 @@ def start_worker(bot_id: str, platform: str, streamer_id: str,
     _ACTIVE_WORKERS[bot_id] = worker
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
+    try:
+        with connection() as conn:
+            conn.execute("UPDATE viewer_plans SET status='가동 중' WHERE id=?", (bot_id,))
+    except Exception:
+        pass
     return worker
 
 
@@ -2940,6 +2945,7 @@ def stop_worker(bot_id: str) -> None:
             conn.execute("UPDATE viewer_plans SET status='종료' WHERE id=?", (bot_id,))
     except Exception:
         pass
+    st.rerun()
 
 
 def render_dashboard():
