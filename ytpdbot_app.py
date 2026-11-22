@@ -1244,7 +1244,7 @@ def collect_and_verify_proxies(
                 "INSERT OR IGNORE INTO proxy_settings "
                 "(name, endpoint, enabled, updated_at, source, last_checked_at, "
                 "health_status, quarantined, failure_reason) "
-                "VALUES (?, ?, 0, ?, '자동 수집', ?, '정상', 0, '')",
+                "VALUES (?, ?, 1, ?, '자동 수집', ?, '정상', 0, '')",
                 (
                     _proxy_inventory_name(endpoint),
                     endpoint,
@@ -2596,7 +2596,7 @@ class BotWorker:
     def _proxies(self) -> list[dict]:
         with connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 AND last_exit_ip<>'' ORDER BY latency_ms ASC"
+                "SELECT * FROM proxy_settings WHERE health_status='정상' AND enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
             ).fetchall()
             return [dict(r) for r in rows]
 
