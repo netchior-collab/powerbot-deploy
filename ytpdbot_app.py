@@ -1747,6 +1747,9 @@ def expire_viewer_plans() -> int:
             "WHERE status!='종료' AND ends_at!='' AND ends_at<=?",
             (timestamp, timestamp),
         )
+    # 종료된 계획의 워커를 멈춤 (시청자 수 0, CPU 절약)
+    for bot_id in list(_ACTIVE_WORKERS.keys()):
+        stop_worker(bot_id)
     return result.rowcount
 
 
@@ -3103,11 +3106,6 @@ def stop_worker(bot_id: str) -> None:
     worker = _ACTIVE_WORKERS.pop(bot_id, None)
     if worker:
         worker.stop()
-    try:
-        with connection() as conn:
-            conn.execute("UPDATE viewer_plans SET status='종료' WHERE id=?", (bot_id,))
-    except Exception:
-        pass
     st.rerun()
 
 
