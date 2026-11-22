@@ -47,7 +47,7 @@ CONTROL_STATUSES = ["실행", "일시중지", "종료"]
 VIEWER_PLAN_STATUSES = ["대기", "가동 중", "일시중지", "종료"]
 MIN_VIEWER_COUNT = 1
 MAX_VIEWER_COUNT = 1500
-VIEWER_COUNT_STEP = 50
+VIEWER_COUNT_STEP = 1
 PARTNER_LIMIT = 2000
 PARTNER_LIMITS = {"사장님(나)": PARTNER_LIMIT}
 MOTION_TYPES = [
@@ -1643,7 +1643,7 @@ def add_viewer_plan(
     ends_at = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat(
         timespec="seconds"
     )
-    current_count = 0 if "서서히" in motion_type else viewer_count
+    current_count = 0  # 항상 0부터 시작 — 워커가 연결될 때 _update_db이 갱신
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         allowed = conn.execute(
@@ -1774,7 +1774,7 @@ def refresh_viewer_plan_progress() -> int:
         ).fetchall()
         for row in rows:
             if "서서히" not in row["motion_type"]:
-                planned_count = row["viewer_count"]
+                planned_count = min(row["viewer_count"], row["current_count"])
             else:
                 try:
                     started_at = datetime.fromisoformat(row["started_at"])
@@ -2973,6 +2973,11 @@ class BotWorker:
                     (self.session_id, self.platform, self.streamer_id, status,
                      connected, timestamp, timestamp),
                 )
+            # viewer_plans.current_count도 갱신 (진짜 연결된 수)
+            conn.execute(
+                "UPDATE viewer_plans SET current_count=?, updated_at=? WHERE id=?",
+                (connected, timestamp, self.bot_id),
+            )
             # 최신화 로직 연동 — viewer_plans.current_count 갱신
             conn.execute(
                 "UPDATE viewer_plans SET current_count=?, updated_at=? "
@@ -3136,6 +3141,7 @@ def stop_worker(bot_id: str) -> None:
     worker = _ACTIVE_WORKERS.pop(bot_id, None)
     if worker:
         worker.stop()
+        worker._connected = 0
     st.rerun()
 
 
