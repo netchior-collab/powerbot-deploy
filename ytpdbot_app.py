@@ -2663,13 +2663,16 @@ class BotWorker:
     """
 
     def __init__(self, bot_id: str, platform: str, streamer_id: str,
-                 target_count: int, proxy_name: str = "", session_id: str = ""):
+                 target_count: int, proxy_name: str = "", session_id: str = "",
+                 motion_type: str = "", chat_mode: str = "자연 채팅"):
         self.bot_id = bot_id
         self.platform = platform
         self.streamer_id = streamer_id
         self.target_count = target_count
         self.proxy_name = proxy_name
         self.session_id = session_id
+        self.motion_type = motion_type
+        self.chat_mode = chat_mode
         self._stop_event = threading.Event()
         self._connected = 0
         self._ws_list = []  # WebSocket 연결 목록
@@ -2932,11 +2935,19 @@ class BotWorker:
                 (self.bot_id,),
             ).fetchall()
         for chat in chats:
+            msg = chat["message"]
+            # 팬더티비: WebSocket으로 채팅 전송
+            if self.platform == "pandatv" and self._ws_list:
+                for ws in self._ws_list[:3]:  # 첫 3개 WS로 전송
+                    try:
+                        ws.send(json.dumps({"cmd":"msg","userId":f"bot{random.randint(100000,999999)}","msg":msg}))
+                    except Exception:
+                        pass
             with connection() as conn:
                 conn.execute(
                     "INSERT INTO chat_logs (id, platform, account_name, message, status, sent_at) VALUES (?,?,?,?,?,?)",
                     (secrets.token_urlsafe(10), self.platform, self.streamer_id,
-                     chat["message"], '전송', now()),
+                     msg, '전송', now()),
                 )
 
     def _update_db(self, connected: int, status: str) -> None:
