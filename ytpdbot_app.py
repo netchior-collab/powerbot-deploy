@@ -2600,6 +2600,10 @@ class BotWorker:
         self._connected = 0
         self._ws_list = []  # WebSocket 연결 목록
 
+    @property
+    def running(self) -> bool:
+        return not self._stop_event.is_set()
+
     def _proxies(self) -> list[dict]:
         with connection() as conn:
             rows = conn.execute(
@@ -2809,7 +2813,6 @@ class BotWorker:
             ok, real_count, chat_host, chat_port = self._watch_api(proxy)
             if ok:
                 self._connected += 1
-                self._update_db(real_count, "모니터링")
                 if self.platform == "pandatv" and chat_host:
                     try:
                         ws = websocket.WebSocket()
@@ -2833,7 +2836,7 @@ class BotWorker:
                             pass
             if "채팅" in self.chat_mode and random.random() < 0.1:
                 self._send_chat()
-            time.sleep(delay)
+            self._update_db(self._connected, "모니터링")
         # ② 유지 루프 — 55초마다 모든 WS 끊고 다시 연결
         tick = 0
         while not self._stop_event.is_set():
