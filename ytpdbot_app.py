@@ -2098,7 +2098,7 @@ def main() -> None:
                         f"자동 종료 {plan['ends_at']}"
                     )
                     c1, c2 = st.columns(2)
-                    if plan["status"] == "대기" and c1.button(
+                    if plan["status"] in ("대기", "가동 중") and c1.button(
                         "계획 일시중지", key=f"pause_viewer_plan_{plan['id']}"
                     ):
                         set_viewer_plan_status(plan["id"], "일시중지")
@@ -2221,7 +2221,7 @@ def main() -> None:
                 if saved:
                     if proxy_enabled:
                         try:
-                            route_result = activate_proxy_with_failover(proxy_name)
+                            route_result = activate_proxy_with_failover(st.session_state["single_proxy_name"])
                         except ValueError as exc:
                             st.error(str(exc))
                         else:
@@ -2901,7 +2901,7 @@ class BotWorker:
         return False, 0, "", 0
 
     def _ping_platform(self, proxy: dict | None) -> tuple[bool, str]:
-        ok, _cnt = self._watch_api(proxy)
+        ok, _cnt, _ch, _cp = self._watch_api(proxy)
         return ok, f"{self.platform} 접속 {'성공' if ok else '실패'}"
 
     def _send_chat(self) -> None:
