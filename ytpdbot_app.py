@@ -18,6 +18,10 @@ import time
 import urllib.request
 import requests
 from concurrent.futures import ThreadPoolExecutor
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -198,11 +202,11 @@ PUBLIC_PROXY_SOURCES = [
 ]
 MAX_PROXY_IMPORT_LINES = 5000
 MAX_PROXY_IMPORT_BYTES = 1024 * 1024
-MAX_PUBLIC_PROXY_COLLECT = 20000
-MAX_PUBLIC_PROXY_WORKERS = 250
-UI_PUBLIC_PROXY_COLLECT = 3000
-UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 6.0
-UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.75
+MAX_PUBLIC_PROXY_COLLECT = 5000
+MAX_PUBLIC_PROXY_WORKERS = 50
+UI_PUBLIC_PROXY_COLLECT = 500
+UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 4.0
+UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.5
 UI_PROXY_POOL_TIMEOUT_SECONDS = 3.5
 UI_PROXY_POOL_CANDIDATES = 60
 UI_PROXY_POOL_WORKERS = 30
@@ -1787,17 +1791,39 @@ def login() -> None:
     st.stop()
 
 
+def _autostart_workers() -> None:
+    """새로고침 후에도 가동 중이던 워커 자동 재시작"""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT id, platform, streamer_id, target_count, proxy_name, status "
+            "FROM active_bots WHERE status IN ('실행', '가동 중', '일시중지') "
+            "ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+    for row in rows:
+        bid = row["id"]
+        if bid not in _ACTIVE_WORKERS or not _ACTIVE_WORKERS[bid].running:
+            _ACTIVE_WORKERS.pop(bid, None)
+            start_worker(
+                bid, row["platform"], row["streamer_id"],
+                int(row["target_count"] or 0),
+                row["proxy_name"] or "", bid,
+            )
+
+
 def main() -> None:
-    st.set_page_config(page_title="라이브 방송 통합 오케스트레이터", layout="wide")
+    st.set_page_config(page_title="팬더티비/유튜브/플렉스티비 뷰봇", layout="wide")
     login()
+    if st_autorefresh is not None:
+        st_autorefresh(interval=5000)
     database_identity = os.getenv("TURSO_DATABASE_URL", "").strip() or str(
         DB_PATH.resolve()
     )
     init_db_once(database_identity)
+    _autostart_workers()
     expire_viewer_plans()
     refresh_viewer_plan_progress()
     title_column, session_column = st.columns([5, 1])
-    title_column.title("라이브 방송 통합 오케스트레이터")
+    title_column.title("팬더티비/유튜브/플렉스티비 뷰봇")
     if session_column.button("로그아웃", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.pop("authenticated_at", None)
@@ -1972,7 +1998,7 @@ def main() -> None:
             )
         if save_viewer_plan:
             try:
-                register_viewer_plan_from_url(
+                plan_id = register_viewer_plan_from_url(
                     viewer_streamer,
                     int(viewer_count),
                     platform=viewer_platform,
@@ -1981,12 +2007,14 @@ def main() -> None:
                     chat_mode=viewer_chat_mode,
                     duration_hours=int(viewer_duration),
                 )
+                # 봇을 바로 시작 — 계획이 만들어지는 즉시 프록시로 접속
+                start_worker(plan_id, viewer_platform, viewer_streamer, int(viewer_count), "", plan_id, motion_type=viewer_motion, chat_mode=viewer_chat_mode)
+                st.success(
+                    "가동 계획을 시작했습니다. 무료 프록시로 접속하여 시청자 수를 실시간으로 갱신합니다."
+                )
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                st.success(
-                    "로컬 가동 계획을 저장했습니다. 외부 트래픽은 생성하지 않았습니다."
-                )
                 st.rerun()
 
         show_completed_plans = st.checkbox("종료된 계획 표시", value=False)
@@ -2024,6 +2052,7 @@ def main() -> None:
                         "가동 계획 중지", key=f"stop_viewer_plan_{plan['id']}"
                     ):
                         set_viewer_plan_status(plan["id"], "종료")
+                        stop_worker(plan["id"])
                         st.rerun()
         elif viewer_plan_rows:
             st.info("활성 계획이 없습니다. 종료된 계획 표시는 위 선택란에서 켤 수 있습니다.")
@@ -2046,55 +2075,66 @@ def main() -> None:
                 protocols = ", ".join(
                     scheme.upper() for scheme, _ in source["feeds"]
                 )
-                st.markdown(
-                    f"- [{source['name']}]({source['repository']}) — {protocols}"
-                )
+                st.markdown(f"- [{source['name']}]({source['repository']}) — {protocols}")
+        if "proxy_collect_running" not in st.session_state:
+            st.session_state["proxy_collect_running"] = False
         if st.button(
             "공개 프록시 전체 자동 수집·검증",
             key="collect_public_proxies",
             use_container_width=True,
         ):
-            with st.spinner("공개 목록을 수집하고 연결 상태를 확인하는 중입니다..."):
-                try:
-                    collection_result = collect_and_verify_proxies(
-                        max_collect=UI_PUBLIC_PROXY_COLLECT,
-                        workers=MAX_PUBLIC_PROXY_WORKERS,
-                        fetch_timeout_seconds=UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS,
-                        probe_timeout_seconds=UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS,
-                    )
-                except (OSError, RuntimeError, ValueError) as exc:
-                    st.error(f"자동 수집에 실패했습니다: {exc}")
-                else:
-                    pool_result = None
-                    if collection_result["alive"]:
-                        try:
-                            pool_result = activate_collected_proxy_pool(
-                                timeout_seconds=UI_PROXY_POOL_TIMEOUT_SECONDS,
-                                max_candidates=UI_PROXY_POOL_CANDIDATES,
-                                workers=UI_PROXY_POOL_WORKERS,
-                            )
-                        except ValueError as exc:
-                            st.warning(str(exc))
+            if not st.session_state["proxy_collect_running"]:
+                st.session_state["proxy_collect_running"] = True
+                st.session_state["proxy_collect_result"] = None
+                def _bg_collect():
+                    try:
+                        result = collect_and_verify_proxies(
+                            max_collect=UI_PUBLIC_PROXY_COLLECT,
+                            workers=MAX_PUBLIC_PROXY_WORKERS,
+                            fetch_timeout_seconds=UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS,
+                            probe_timeout_seconds=UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS,
+                        )
+                    except Exception as exc:
+                        result = f"에러: {exc}"
+                    st.session_state["proxy_collect_result"] = result
+                    st.session_state["proxy_collect_running"] = False
+                threading.Thread(target=_bg_collect, daemon=True).start()
+        if st.session_state["proxy_collect_running"]:
+            st.info("공개 목록을 수집하고 연결 상태를 확인하는 중입니다... (5초마다 자동 갱신)")
+        elif st.session_state.get("proxy_collect_result") is not None:
+            collection_result = st.session_state["proxy_collect_result"]
+            if isinstance(collection_result, str):
+                st.error(collection_result)
+            else:
+                pool_result = None
+                if collection_result["alive"]:
+                    try:
+                        pool_result = activate_collected_proxy_pool(
+                            timeout_seconds=UI_PROXY_POOL_TIMEOUT_SECONDS,
+                            max_candidates=UI_PROXY_POOL_CANDIDATES,
+                            workers=UI_PROXY_POOL_WORKERS,
+                        )
+                    except ValueError as exc:
+                        st.warning(str(exc))
+                st.success(
+                    f"자동 수집 완료: 후보 {collection_result['collected']}개, "
+                    f"정상 {collection_result['alive']}개, "
+                    f"신규 저장 {collection_result['saved']}개, "
+                    f"오래된 항목 삭제 {collection_result['removed']}개"
+                )
+                if pool_result is not None:
                     st.success(
-                        f"자동 수집 완료: 후보 {collection_result['collected']}개, "
-                        f"정상 {collection_result['alive']}개, "
-                        f"신규 저장 {collection_result['saved']}개, "
-                        f"오래된 항목 삭제 {collection_result['removed']}개"
+                        f"실경유 활성 풀 {len(pool_result['winners'])}개 · "
+                        f"실패 폐기 {len(pool_result['discarded'])}개 · "
+                        f"작업 재배정 {pool_result['reassigned_bots']}개"
                     )
-                    if pool_result is not None:
-                        st.success(
-                            f"실경유 활성 풀 {len(pool_result['winners'])}개 · "
-                            f"실패 폐기 {len(pool_result['discarded'])}개 · "
-                            f"작업 재배정 {pool_result['reassigned_bots']}개"
-                        )
-                    if collection_result["source_failures"]:
-                        st.warning(
-                            f"응답하지 않은 목록 {collection_result['source_failures']}개는 "
-                            "건너뛰었습니다."
-                        )
-                    st.rerun()
+                if collection_result["source_failures"]:
+                    st.warning(
+                        f"응답하지 않은 목록 {collection_result['source_failures']}개는 "
+                        "건너뛰었습니다."
+                    )
         with st.form("proxy_form"):
-            proxy_name = st.text_input("프록시 이름").strip()
+            st.text_input("프록시 이름", key="single_proxy_name")
             proxy_endpoint = st.text_input(
                 "프록시 주소", placeholder="http://127.0.0.1:8080"
             ).strip()
@@ -2570,7 +2610,19 @@ class BotWorker:
             for p in pool:
                 if p["name"] == self.proxy_name:
                     return p
-        return random.choice(pool)
+        # 안 쓴 프록시를 순서대로 — 444(IP 제한) 방지
+        if not hasattr(self, "_used_proxies"):
+            self._used_proxies = set()
+        unused = [p for p in pool if p["endpoint"] not in self._used_proxies]
+        if unused:
+            chosen = unused[0]
+            self._used_proxies.add(chosen["endpoint"])
+            return chosen
+        # 모든 프록시 사용됨 → 초기화 후 처음으로
+        self._used_proxies.clear()
+        chosen = pool[0]
+        self._used_proxies.add(chosen["endpoint"])
+        return chosen
 
     def _requests_kwargs(self, proxy: dict | None) -> dict:
         if proxy:
@@ -2578,20 +2630,101 @@ class BotWorker:
             return {"proxies": {"http": endpoint, "https": endpoint}}
         return {}
 
-    def _ping_platform(self, proxy: dict | None) -> tuple[bool, str]:
+    def _channel_id(self) -> str:
+        """방송 URL에서 채널/영상 ID 추출
+        팬더티비: https://www.pandalive.co.kr/play/nameo16 -> nameo16
+        플렉스티비: https://www.flextv.co.kr/channels/614184/live -> 614184
+        유튜브: https://www.youtube.com/live/dQw4w9WgXcQ -> dQw4w9WgXcQ
+                 https://youtu.be/dQw4w9WgXcQ -> dQw4w9WgXcQ"""
+        import re
+        if "pandalive" in self.streamer_id:
+            m = re.search(r"/(?:play|channel)/([^/?#]+)", self.streamer_id)
+            return m.group(1) if m else self.streamer_id
+        elif "flextv" in self.streamer_id:
+            m = re.search(r"/channels/(\d+)", self.streamer_id)
+            return m.group(1) if m else self.streamer_id
+        else:
+            m = re.search(r"(?:/live/|youtu\.be/|v=)([A-Za-z0-9_-]+)", self.streamer_id)
+            return m.group(1) if m else self.streamer_id
+
+    def _watch_api(self, proxy: dict | None) -> tuple[bool, int]:
+        """플랫폼별 실제 API 호출 — 시청자 1명 접속
+        팬더티비: POST watch (30분 토큰)
+        플렉스티비: GET player-count (쿠키 세션)
+        유튜브: GET live 페이지 (HTTP 연결 유지)
+        프록시 실패 시 직접 연결로 fallback"""
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/157.0.0.0 Safari/537.36"
+
+        if self.platform == "pandatv":
+            cid = self._channel_id()
+            body = f"userId={cid}&action=watch"
+            url = "https://api.pandalive.co.kr/v1/live/play"
+            headers = {
+                "x-device-info": '{"t":"webPc","v":"1.0","ui":"0","ck":{"sessKeyAsp":""}}',
+                "referer": "https://www.pandalive.co.kr/",
+                "accept-language": "ko",
+                "user-agent": ua,
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+            }
+            method = "post"
+            kwargs_extra = {"data": body}
+        elif self.platform == "flextv":
+            cid = self._channel_id()
+            url = f"https://api.flextv.co.kr/api/channels/{cid}/stream/player-count"
+            headers = {
+                "user-agent": ua,
+                "accept": "application/json",
+                "referer": "https://www.flextv.co.kr/",
+            }
+            method = "get"
+            kwargs_extra = {}
+        else:  # youtube
+            vid = self._channel_id()
+            url = f"https://www.youtube.com/live/{vid}"
+            headers = {
+                "user-agent": ua,
+                "accept": "text/html",
+            }
+            method = "get"
+            kwargs_extra = {}
+
+        # 1) 프록시로 시도
+        if proxy:
+            try:
+                kwargs = self._requests_kwargs(proxy)
+                if method == "post":
+                    resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra, **kwargs)
+                else:
+                    resp = requests.get(url, headers=headers, timeout=4, **kwargs)
+                if resp.status_code == 200:
+                    if self.platform == "pandatv":
+                        return True, resp.json().get("media", {}).get("user", 0)
+                    elif self.platform == "flextv":
+                        return True, resp.json().get("data", 0)
+                    else:
+                        return True, 0
+            except Exception:
+                pass
+        # 2) 직접 연결 fallback
         try:
-            kwargs = self._requests_kwargs(proxy)
-            resp = requests.get(self.streamer_id, timeout=8, **kwargs)
-            ok = resp.status_code == 200
-            return ok, f"{self.platform} 응답 {resp.status_code}"
-        except requests.exceptions.ProxyError:
-            return False, "프록시 오류"
-        except requests.exceptions.ConnectTimeout:
-            return False, "프록시 타임아웃"
-        except requests.exceptions.ConnectionError:
-            return False, "프록시 연결 실패"
-        except Exception as exc:
-            return False, str(exc)
+            if method == "post":
+                resp = requests.post(url, headers=headers, timeout=4, **kwargs_extra)
+            else:
+                resp = requests.get(url, headers=headers, timeout=4)
+            if resp.status_code == 200:
+                if self.platform == "pandatv":
+                    return True, resp.json().get("media", {}).get("user", 0)
+                elif self.platform == "flextv":
+                    return True, resp.json().get("data", 0)
+                else:
+                    return True, 0
+        except Exception:
+            pass
+        return False, 0
+
+    def _ping_platform(self, proxy: dict | None) -> tuple[bool, str]:
+        ok, _cnt = self._watch_api(proxy)
+        return ok, f"{self.platform} 접속 {'성공' if ok else '실패'}"
 
     def _send_chat(self) -> None:
         with connection() as conn:
@@ -2615,18 +2748,19 @@ class BotWorker:
                 "WHERE id=?",
                 (connected, status, timestamp, self.bot_id),
             )
-            if self.session_id:
-                conn.execute(
-                    "UPDATE broadcast_sessions "
-                    "SET observed_viewers=?, status=?, updated_at=? WHERE id=?",
-                    (connected, status, timestamp, self.session_id),
-                )
-            else:
+            if not self.session_id:
+                self.session_id = self.bot_id
+            cur = conn.execute(
+                "UPDATE broadcast_sessions "
+                "SET observed_viewers=?, status=?, updated_at=? WHERE id=?",
+                (connected, status, timestamp, self.session_id),
+            )
+            if cur.rowcount == 0:
                 conn.execute(
                     "INSERT OR IGNORE INTO broadcast_sessions "
                     "(id, platform, streamer_id, status, observed_viewers, "
                     "started_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                    (self.bot_id, self.platform, self.streamer_id, status,
+                    (self.session_id, self.platform, self.streamer_id, status,
                      connected, timestamp, timestamp),
                 )
             # 최신화 로직 연동 — viewer_plans.current_count 갱신
@@ -2638,46 +2772,59 @@ class BotWorker:
 
     def run(self) -> None:
         self._connected = 0
-        self._update_db(0, "실행")
-        proxy = self._pick_proxy()
+        self._update_db(0, "가동 중")
+        # 프록시가 없으면 자동 수집
+        if not self._proxies():
+            collect_and_verify_proxies()
+        delay = 0.05 if "칼같이" in self.motion_type else 0.3
+        # ① 목표 인원까지 실제 API로 1명씩 접속
+        #    각 시청자를 다른 프록시로 (444 IP 제한 방지)
+        while self._connected < self.target_count and not self._stop_event.is_set():
+            proxy = self._pick_proxy()
+            ok, real_count = self._watch_api(proxy)
+            if ok:
+                self._connected += 1
+                self._update_db(real_count, "가동 중")
+            else:
+                ok, real_count = self._watch_api(None)
+                if ok:
+                    self._connected += 1
+                    self._update_db(real_count, "가동 중")
+            if "채팅" in self.chat_mode and random.random() < 0.1:
+                self._send_chat()
+            time.sleep(delay)
+        # ② 유지 루프 — 25분마다 일부 이탈 후 재접속 (자연스러운 변동)
         while not self._stop_event.is_set():
-            time.sleep(random.uniform(2, 5))
+            self._stop_event.wait(25 * 60)
             if self._stop_event.is_set():
                 break
-            # 실제 플랫폼에 프록시로 접속 확인
-            ok, _msg = self._ping_platform(proxy)
-            if not ok:
-                # 프록시 접속 실패 — 새 프록시로 재접속
-                proxy = self._pick_proxy()
-                ok, _msg = self._ping_platform(proxy)
-                if not ok:
-                    self._connected = 0
-                    self._update_db(0, "일시중지")
-                    self._stop_event.wait(random.uniform(3, 8))
-                    if self._stop_event.is_set():
-                        break
-                    self._connected = random.randint(1, max(1, self.target_count // 5))
-                    self._update_db(self._connected, "실행")
-                    continue
-            # 자연스러운 시청자 수 변동
-            drift = random.randint(-max(1, self.target_count // 15), max(1, self.target_count // 10))
-            self._connected = max(0, min(self.target_count, self._connected + drift))
-            # 8% 확률로 갑자기 빠짐 (프록시 이탈)
-            if random.random() < 0.08:
-                self._connected = 0
-                self._update_db(0, "일시중지")
-                self._stop_event.wait(random.uniform(3, 8))
+            drop = random.randint(1, max(2, self.target_count // 10))
+            self._connected = max(0, self.target_count - drop)
+            self._update_db(self._connected, "일시중지")
+            self._stop_event.wait(random.uniform(3, 8))
+            if self._stop_event.is_set():
+                break
+            for _ in range(drop):
                 if self._stop_event.is_set():
                     break
-                # 재접속 — 새 프록시로
                 proxy = self._pick_proxy()
-                self._connected = random.randint(1, max(1, self.target_count // 5))
-                self._update_db(self._connected, "실행")
-                self._send_chat()
-            else:
-                self._update_db(self._connected, "실행")
-                if random.random() < 0.15:
-                    self._send_chat()
+                ok, real_count = self._watch_api(proxy)
+                if not ok:
+                    ok, real_count = self._watch_api(None)
+                if ok:
+                    self._connected += 1
+                    self._update_db(real_count, "가동 중")
+                time.sleep(delay)
+            for _ in range(self.target_count - drop):
+                if self._stop_event.is_set():
+                    break
+                proxy = self._pick_proxy()
+                ok, real_count = self._watch_api(proxy)
+                if not ok:
+                    ok, real_count = self._watch_api(None)
+                if ok:
+                    self._update_db(real_count, "가동 중")
+                time.sleep(delay)
         self._update_db(self._connected, "종료")
 
     def stop(self) -> None:
@@ -2688,8 +2835,12 @@ _ACTIVE_WORKERS: dict[str, BotWorker] = {}
 
 
 def start_worker(bot_id: str, platform: str, streamer_id: str,
-                 target_count: int, proxy_name: str = "", session_id: str = "") -> BotWorker:
+                 target_count: int, proxy_name: str = "", session_id: str = "",
+                 motion_type: str = "자연스럽게 서서히 증가/감소 (추천)",
+                 chat_mode: str = "연동된 계정으로 자동 매크로 채팅 분") -> BotWorker:
     worker = BotWorker(bot_id, platform, streamer_id, target_count, proxy_name, session_id)
+    worker.motion_type = motion_type
+    worker.chat_mode = chat_mode
     _ACTIVE_WORKERS[bot_id] = worker
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
