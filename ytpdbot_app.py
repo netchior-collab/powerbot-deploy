@@ -2721,7 +2721,19 @@ class BotWorker:
                     if self.platform == "pandatv":
                         d = resp.json()
                         cs = d.get("media", {}).get("chatServer", {})
-                        return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
+                        jwt = d.get("token", "")
+                        real = d.get("media", {}).get("user", 0)
+                        if jwt:
+                            try:
+                                cu = requests.get(
+                                    "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
+                                    params={"channel": d.get("channel", ""), "token": jwt},
+                                    timeout=5, proxies=kwargs,
+                                )
+                                real = cu.json().get("count", real)
+                            except Exception:
+                                pass
+                        return True, real, cs.get("host", ""), cs.get("port", 0)
                     elif self.platform == "flextv":
                         return True, resp.json().get("data", 0), "", 0
                     else:
@@ -2744,7 +2756,19 @@ class BotWorker:
                 if self.platform == "pandatv":
                     d = resp.json()
                     cs = d.get("media", {}).get("chatServer", {})
-                    return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
+                    jwt = d.get("token", "")
+                    real = d.get("media", {}).get("user", 0)
+                    if jwt:
+                        try:
+                            cu = requests.get(
+                                "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
+                                params={"channel": d.get("channel", ""), "token": jwt},
+                                timeout=5,
+                            )
+                            real = cu.json().get("count", real)
+                        except Exception:
+                            pass
+                    return True, real, cs.get("host", ""), cs.get("port", 0)
                 elif self.platform == "flextv":
                     return True, resp.json().get("data", 0), "", 0
                 else:
