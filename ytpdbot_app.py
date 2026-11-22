@@ -17,6 +17,8 @@ import threading
 import time
 import urllib.request
 import requests
+import re
+import websocket
 from concurrent.futures import ThreadPoolExecutor
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -2677,12 +2679,10 @@ class BotWorker:
             }
             method = "get"
             kwargs_extra = {}
-            # 새 세션(쿠키)으로 +1
             session = requests.Session()
             session.headers.update(headers)
         else:  # youtube
             vid = self._channel_id()
-            # 실제 라이브 URL인지 확인
             url = f"https://www.youtube.com/live/{vid}"
             headers = {
                 "user-agent": ua,
@@ -2706,13 +2706,15 @@ class BotWorker:
                         resp = session.get(url, timeout=4, **kwargs)
                     else:
                         resp = requests.get(url, headers=headers, timeout=4, **kwargs)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and resp.text:
                     if self.platform == "pandatv":
-                        return True, resp.json().get("media", {}).get("user", 0)
+                        d = resp.json()
+                        cs = d.get("chatServer", {})
+                        return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
                     elif self.platform == "flextv":
-                        return True, resp.json().get("data", 0)
+                        return True, resp.json().get("data", 0), "", 0
                     else:
-                        return True, 0
+                        return True, 0, "", 0
             except Exception:
                 pass
         # 2) 직접 연결 fallback
@@ -2727,16 +2729,18 @@ class BotWorker:
                     resp = session.get(url, timeout=4)
                 else:
                     resp = requests.get(url, headers=headers, timeout=4)
-            if resp.status_code == 200:
+            if resp.status_code == 200 and resp.text:
                 if self.platform == "pandatv":
-                    return True, resp.json().get("media", {}).get("user", 0)
+                    d = resp.json()
+                    cs = d.get("chatServer", {})
+                    return True, d.get("media", {}).get("user", 0), cs.get("host", ""), cs.get("port", 0)
                 elif self.platform == "flextv":
-                    return True, resp.json().get("data", 0)
+                    return True, resp.json().get("data", 0), "", 0
                 else:
-                    return True, 0
+                    return True, 0, "", 0
         except Exception:
             pass
-        return False, 0
+        return False, 0, "", 0
 
     def _ping_platform(self, proxy: dict | None) -> tuple[bool, str]:
         ok, _cnt = self._watch_api(proxy)
@@ -2797,21 +2801,33 @@ class BotWorker:
         #    각 시청자를 다른 프록시로 (444 IP 제한 방지)
         while self._connected < self.target_count and not self._stop_event.is_set():
             proxy = self._pick_proxy()
-            ok, real_count = self._watch_api(proxy)
+            ok, real_count, chat_host, chat_port = self._watch_api(proxy)
             if ok:
                 self._connected += 1
                 self._update_db(real_count, "가동 중")
             else:
-                ok, real_count = self._watch_api(None)
+                ok, real_count, chat_host, chat_port = self._watch_api(None)
                 if ok:
                     self._connected += 1
                     self._update_db(real_count, "가동 중")
             if "채팅" in self.chat_mode and random.random() < 0.1:
                 self._send_chat()
             time.sleep(delay)
-        # ② 유지 루프 — 25분마다 일부 이탈 후 재접속 (자연스러운 변동)
+        # ② 유지 루프 — 1분마다 action=watch로 세션 갱신 + WebSocket 유지
         while not self._stop_event.is_set():
-            self._stop_event.wait(25 * 60)
+            # 1분마다 10%의 시청자 세션 갱신 (drift 방지)
+            refresh = max(1, self.target_count // 10)
+            for _ in range(refresh):
+                if self._stop_event.is_set():
+                    break
+                proxy = self._pick_proxy()
+                ok, real_count, _, _ = self._watch_api(proxy)
+                if not ok:
+                    ok, real_count, _, _ = self._watch_api(None)
+                time.sleep(delay)
+            self._update_db(self._connected, "가동 중")
+            # 25분마다 일부 이탈 후 재접속 (자연스러운 변동)
+            self._stop_event.wait(24 * 60)
             if self._stop_event.is_set():
                 break
             drop = random.randint(1, max(2, self.target_count // 10))
@@ -2824,9 +2840,9 @@ class BotWorker:
                 if self._stop_event.is_set():
                     break
                 proxy = self._pick_proxy()
-                ok, real_count = self._watch_api(proxy)
+                ok, real_count, _, _ = self._watch_api(proxy)
                 if not ok:
-                    ok, real_count = self._watch_api(None)
+                    ok, real_count, _, _ = self._watch_api(None)
                 if ok:
                     self._connected += 1
                     self._update_db(real_count, "가동 중")
