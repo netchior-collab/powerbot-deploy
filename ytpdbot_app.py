@@ -1084,7 +1084,7 @@ def check_proxy_inventory_health(
     def probe(proxy: Any) -> tuple[str, bool, str]:
         try:
             check_proxy_connection(proxy["endpoint"], timeout_seconds)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, requests.RequestException) as exc:
             return proxy["name"], False, f"연결 실패 ({type(exc).__name__})"
         return proxy["name"], True, ""
 
@@ -1104,7 +1104,11 @@ def check_proxy_inventory_health(
                     (checked_at, checked_at, name),
                 )
             else:
-                conn.execute("DELETE FROM proxy_settings WHERE name=?", (name,))
+                conn.execute(
+                    "UPDATE proxy_settings SET enabled=0, quarantined=1, "
+                    "health_status='오류', failure_reason=?, updated_at=? WHERE name=?",
+                    (reason, checked_at, name),
+                )
     if failed_names:
         with connection() as conn:
             fallback = conn.execute(
@@ -1747,9 +1751,15 @@ def expire_viewer_plans() -> int:
             "WHERE status!='종료' AND ends_at!='' AND ends_at<=?",
             (timestamp, timestamp),
         )
-    # 종료된 계획의 워커를 멈춤 (시청자 수 0, CPU 절약)
-    for bot_id in list(_ACTIVE_WORKERS.keys()):
-        stop_worker(bot_id)
+    # 종료된 계획의 워커만 멈춤
+    if result.rowcount > 0:
+        with connection() as conn:
+            expired_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM viewer_plans WHERE status='종료' AND ends_at!=''"
+            ).fetchall()]
+        for bot_id in expired_ids:
+            if bot_id in _ACTIVE_WORKERS:
+                stop_worker(bot_id)
     return result.rowcount
 
 
