@@ -1426,22 +1426,20 @@ def set_bot_status(bot_id: str, status: str) -> None:
     if status == "종료":
         stop_worker(bot_id)
     elif status == "실행":
-        # 기존 워커가 없으면 새로 시작
+        # 기존 워커가 없으면 새로 시작 — viewer_plans 기준으로 (active_bots.id == viewer_plans.bot_id)
         if bot_id not in _ACTIVE_WORKERS:
             with connection() as conn:
                 row = conn.execute(
-                    "SELECT platform, streamer_id, proxy_name FROM active_bots WHERE id=?",
+                    "SELECT platform, streamer_id, proxy_name, viewer_count, motion_type, chat_mode "
+                    "FROM viewer_plans WHERE bot_id=? AND status!='종료'",
                     (bot_id,),
                 ).fetchone()
             if row:
-                with connection() as conn:
-                    plan = conn.execute(
-                        "SELECT viewer_count FROM viewer_plans "
-                        "WHERE streamer_id=? AND status!='종료' LIMIT 1",
-                        (row["streamer_id"],),
-                    ).fetchone()
-                target = plan["viewer_count"] if plan else 200
-                start_worker(bot_id, row["platform"], row["streamer_id"], target, row["proxy_name"], bot_id)
+                start_worker(
+                    bot_id, row["platform"], row["streamer_id"],
+                    int(row["viewer_count"] or 0), row["proxy_name"] or "", bot_id,
+                    row["motion_type"] or "", row["chat_mode"] or "자연 채팅",
+                )
     timestamp = now()
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1504,6 +1502,10 @@ def set_chat_status(chat_id: str, status: str) -> None:
             bot = conn.execute(
                 "SELECT status FROM active_bots WHERE id=?", (chat["bot_id"],)
             ).fetchone()
+            if bot is None:
+                bot = conn.execute(
+                    "SELECT status FROM viewer_plans WHERE bot_id=?", (chat["bot_id"],)
+                ).fetchone()
             if bot is None or bot["status"] != "실행":
                 raise ValueError("실행 중인 봇의 채팅만 다시 시작할 수 있습니다.")
         conn.execute(
@@ -1563,12 +1565,14 @@ def start_bot(
     # 최신화 로직: viewer_plans에서 목표 시청자 수 가져옴
     with connection() as conn:
         plan = conn.execute(
-            "SELECT viewer_count FROM viewer_plans "
-            "WHERE streamer_id=? AND status!='종료' LIMIT 1",
-            (streamer_id,),
+            "SELECT viewer_count, motion_type, chat_mode FROM viewer_plans "
+            "WHERE (streamer_id=? OR streamer_id LIKE ?) AND status!='종료' LIMIT 1",
+            (streamer_id, f"%{streamer_id.rsplit('/', 1)[-1]}%"),
         ).fetchone()
     target = plan["viewer_count"] if plan else 200
-    start_worker(bot_id, platform, streamer_id, target, proxy_name, bot_id)
+    mt = plan["motion_type"] if plan else ""
+    cm = plan["chat_mode"] if plan else "자연 채팅"
+    start_worker(bot_id, platform, streamer_id, target, proxy_name, bot_id, mt, cm)
     return bot_id
 
 
