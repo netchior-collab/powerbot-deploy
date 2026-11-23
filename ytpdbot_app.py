@@ -2859,7 +2859,12 @@ class BotWorker:
             seg_url = self._extract_yt_stream(text)
             if seg_url:
                 try:
-                    (session or requests).get(seg_url, timeout=8, **kwargs)
+                    r = (session or requests).get(seg_url, timeout=8, **kwargs)
+                    # hlsManifestUrl이면 m3u8 → 실제 segment까지 다운로드 (진짜 시청자)
+                    if "m3u8" in seg_url or "manifest" in seg_url or ".m4s" not in seg_url:
+                        lines = [l.strip() for l in r.text.splitlines() if l.strip() and not l.startswith("#")]
+                        if lines:
+                            (session or requests).get(lines[0], timeout=8, **kwargs)
                     return True, 1, "", 0
                 except Exception:
                     pass
