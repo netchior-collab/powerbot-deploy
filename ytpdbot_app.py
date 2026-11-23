@@ -2797,11 +2797,11 @@ class BotWorker:
 
     def _extract_yt_stream(self, html) -> str:
         """유튜브: HTML → videoplayback(HLS) URL 추출"""
+        import json
         try:
-            m = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.*\});', html, re.DOTALL)
+            m = re.search(r'ytInitialPlayerResponse\s*=\s*', html)
             if m:
-                import json
-                pr = json.loads(m.group(1))
+                pr, _ = json.JSONDecoder().raw_decode(html, m.end())
                 sd = pr.get("streamingData", {})
                 hls = sd.get("hlsManifestUrl")
                 if hls:
@@ -2999,16 +2999,10 @@ class BotWorker:
                     (self.session_id, self.platform, self.streamer_id, sess_status,
                      connected, timestamp, timestamp),
                 )
-            # viewer_plans.current_count도 갱신 (진짜 연결된 수)
+            # viewer_plans.current_count 갱신 (진짜 연결된 수)
             conn.execute(
-                "UPDATE viewer_plans SET current_count=?, updated_at=? WHERE id=?",
-                (connected, timestamp, self.bot_id),
-            )
-            # 최신화 로직 연동 — viewer_plans.current_count 갱신
-            conn.execute(
-                "UPDATE viewer_plans SET current_count=?, updated_at=? "
-                "WHERE streamer_id=? AND status!='종료'",
-                (connected, timestamp, self.streamer_id),
+                "UPDATE viewer_plans SET current_count=?, status=?, updated_at=? WHERE id=?",
+                (connected, status, timestamp, self.bot_id),
             )
 
     def run(self) -> None:
