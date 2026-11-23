@@ -796,7 +796,7 @@ def _discard_failed_proxy(name: str, *, pause_dependents: bool) -> list[str]:
         bot_ids = [bot["id"] for bot in affected_bots]
         conn.execute(
             "UPDATE proxy_settings SET enabled=0, quarantined=1, "
-            "health_status='오류', updated_at=? WHERE name=?",
+            "health_status='실패', updated_at=? WHERE name=?",
             (timestamp, name),
         )
         if pause_dependents:
@@ -1110,7 +1110,7 @@ def check_proxy_inventory_health(
             else:
                 conn.execute(
                     "UPDATE proxy_settings SET enabled=0, quarantined=1, "
-                    "health_status='오류', failure_reason=?, updated_at=? WHERE name=?",
+                    "health_status='실패', failure_reason=?, updated_at=? WHERE name=?",
                     (reason, checked_at, name),
                 )
     if failed_names:
