@@ -2830,7 +2830,7 @@ class BotWorker:
                         "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
                         params={"channel": d.get("channel", ""), "token": jwt},
                         timeout=5,
-                        **({"proxies": kwargs} if kwargs else {}),
+                        **(kwargs or {}),
                     )
                     real = cu.json().get("count", real)
                 except Exception:
