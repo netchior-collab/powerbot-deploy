@@ -2673,8 +2673,10 @@ class BotWorker:
 
     def __init__(self, bot_id: str, platform: str, streamer_id: str,
                  target_count: int, proxy_name: str = "", session_id: str = "",
-                 motion_type: str = "", chat_mode: str = "자연 채팅"):
+                 motion_type: str = "", chat_mode: str = "자연 채팅",
+                 plan_id: str = ""):
         self.bot_id = bot_id
+        self.plan_id = plan_id or bot_id
         self.platform = platform
         self.streamer_id = streamer_id
         self.target_count = target_count
@@ -2778,7 +2780,7 @@ class BotWorker:
     def _extract_yt_stream(self, html) -> str:
         """유튜브: HTML → videoplayback(HLS) URL 추출"""
         try:
-            m = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.*?\});', html, re.DOTALL)
+            m = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.*\});', html, re.DOTALL)
             if m:
                 import json
                 pr = json.loads(m.group(1))
@@ -3027,7 +3029,7 @@ class BotWorker:
                 ok, real_count, chat_host, chat_port = self._watch_api(proxy2)
                 if ok:
                     self._connected += 1
-                    self._update_db(real_count, "모니터링")
+                    self._update_db(self._connected, "모니터링")
                     if self.platform == "팬더티비" and chat_host:
                         try:
                             ws = websocket.WebSocket()
@@ -3079,7 +3081,7 @@ class BotWorker:
                             except Exception:
                                 if _retry < 2:
                                     self._stop_event.wait(1)
-                    self._update_db(real_count, "모니터링")
+                    self._update_db(self._connected, "모니터링")
                     if not self._stop_event.wait(delay):
                         continue
             # 25분마다 일부 이탈 후 재접속
@@ -3119,7 +3121,7 @@ class BotWorker:
                                 self._ws_list.append(ws)
                             except Exception:
                                 pass
-                        self._update_db(real_count, "모니터링")
+                        self._update_db(self._connected, "모니터링")
                         if not self._stop_event.wait(delay):
                             break
         self._update_db(self._connected, "종료")
@@ -3160,7 +3162,6 @@ def stop_worker(bot_id: str) -> None:
     if worker:
         worker.stop()
         worker._connected = 0
-    st.rerun()
 
 
 if __name__ == "__main__":
