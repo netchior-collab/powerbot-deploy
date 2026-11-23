@@ -3094,7 +3094,7 @@ class BotWorker:
                         try: ws.close()
                         except Exception: pass
                     self._connected -= 1
-                    self._update_db(self._connected, "일시중지")
+                    self._update_db(self._connected, "가동 중")
                 self._stop_event.wait(random.uniform(3, 8))
                 if self._stop_event.is_set():
                     break
