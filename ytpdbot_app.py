@@ -3063,13 +3063,16 @@ class BotWorker:
                 if ok:
                     self._connected += 1
                     if self.platform == "pandatv" and chat_host:
-                        try:
-                            ws = websocket.WebSocket()
-                            ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
-                            ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
-                            self._ws_list.append(ws)
-                        except Exception:
-                            pass
+                        for _retry in range(3):
+                            try:
+                                ws = websocket.WebSocket()
+                                ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
+                                ws.send(json.dumps({"cmd":"enter","userId":f"bot{random.randint(100000000,999999999)}"}))
+                                self._ws_list.append(ws)
+                                break
+                            except Exception:
+                                if _retry < 2:
+                                    self._stop_event.wait(1)
                     self._update_db(real_count, "모니터링")
                     if not self._stop_event.wait(delay):
                         continue
