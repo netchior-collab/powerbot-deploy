@@ -2766,8 +2766,15 @@ class BotWorker:
             m = re.search(r"/channels/(\d+)", self.streamer_id)
             return m.group(1) if m else self.streamer_id
         else:
+            # /live/VIDEO_ID
             m = re.search(r"(?:/live/|youtu\.be/|v=)([A-Za-z0-9_-]+)", self.streamer_id)
-            return m.group(1) if m else self.streamer_id
+            if m:
+                return m.group(1)
+            # @handle/live (채널 핸들)
+            m = re.search(r"@([A-Za-z0-9_.-]+)", self.streamer_id)
+            if m:
+                return m.group(1)
+            return self.streamer_id
 
     def _download_hls(self, json_text, session=None, **kw) -> bool:
         """플렉스티비: sources[].url(m3u8) → segment 다운로드 = 실제 시청자"""
@@ -2881,7 +2888,11 @@ class BotWorker:
         else:  # youtube
             # videoplayback(HLS)이 실제 시청자. GET /live/{id}만으로는 안 됨
             vid = self._channel_id()
-            url = f"https://www.youtube.com/live/{vid}"
+            # vid가 11자 영상 ID면 /live/ID, 아니면 @handle/live
+            if len(vid) == 11:
+                url = f"https://www.youtube.com/live/{vid}"
+            else:
+                url = f"https://www.youtube.com/@{vid}/live"
             headers = {
                 "user-agent": ua,
                 "accept": "text/html",
