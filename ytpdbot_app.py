@@ -241,15 +241,15 @@ UI_PUBLIC_PROXY_COLLECT = 500
 UI_PUBLIC_PROXY_FETCH_TIMEOUT_SECONDS = 4.0
 UI_PUBLIC_PROXY_PROBE_TIMEOUT_SECONDS = 0.5
 UI_PROXY_POOL_TIMEOUT_SECONDS = 3.5
-UI_PROXY_POOL_CANDIDATES = 300
-UI_PROXY_POOL_WORKERS = 60
+UI_PROXY_POOL_CANDIDATES = 1000
+UI_PROXY_POOL_WORKERS = 120
 PROXY_INVENTORY_DISPLAY_LIMIT = 100
 PROXY_INVENTORY_CONTROL_LIMIT = 20
 MAX_PROXY_FAILOVER_CANDIDATES = 40
 MAX_PROXY_FAILOVER_WORKERS = 10
-MAX_VERIFIED_PROXY_POOL = 100
-MAX_PROXY_POOL_CANDIDATES = 300
-MAX_PROXY_POOL_WORKERS = 60
+MAX_VERIFIED_PROXY_POOL = 200
+MAX_PROXY_POOL_CANDIDATES = 1000
+MAX_PROXY_POOL_WORKERS = 120
 PROXY_EGRESS_CHECK_URL = "https://api.ipify.org?format=json"
 DB_PATH = Path(os.getenv("YTPDBOT_DB_PATH", str(Path(__file__).with_name("broadcast_ops.db")))).expanduser()
 MAX_IDENTIFIER_LENGTH = 100
@@ -2700,10 +2700,21 @@ class BotWorker:
         if self._proxy_cache is not None and _t.time() - self._proxy_cache_time < 30:
             return self._proxy_cache
         with connection() as conn:
+            # 1) 우선순위: 검증된 enabled=1, quarantine=0
             rows = conn.execute(
                 "SELECT * FROM proxy_settings WHERE enabled=1 AND quarantined=0 ORDER BY latency_ms ASC"
             ).fetchall()
-        result = [dict(r) for r in rows]
+            result = [dict(r) for r in rows]
+            # 2) fallback: quarantine=0 (미검증/미활성화)까지 추가
+            if len(result) < 50:
+                more = conn.execute(
+                    "SELECT * FROM proxy_settings WHERE quarantined=0 AND enabled=0 "
+                    "ORDER BY updated_at DESC LIMIT 200"
+                ).fetchall()
+                for r in more:
+                    result.append(dict(r))
+                    if len(result) >= 200:
+                        break
         self._proxy_cache = result
         self._proxy_cache_time = _t.time()
         return result
@@ -2712,25 +2723,24 @@ class BotWorker:
         pool = self._proxies()
         if not pool:
             return None
+        # 실패한 프록시 제외
+        if failed_endpoint:
+            pool = [p for p in pool if p["endpoint"] != failed_endpoint]
+            if not pool:
+                return None
         if self.proxy_name and not failed_endpoint:
             for p in pool:
                 if p["endpoint"] == self.proxy_name or p["name"] == self.proxy_name:
                     return p
-        # 시청자별 고정 IP — 매번 같은 프록시 사용
+        # 시청자별 고정 IP
         if viewer_idx >= 0 and viewer_idx in self._viewer_proxies:
             stored = self._viewer_proxies[viewer_idx]
             stored_ep = stored["endpoint"] if isinstance(stored, dict) else str(stored)
-            if stored_ep not in [p["endpoint"] for p in pool]:
-                pass  # pool에 없으면 새 프록시 할당
-            elif stored["endpoint"] == failed_endpoint:
-                pass  # 실패한 프록시 → 새 프록시
-            else:
+            if stored_ep != failed_endpoint and stored_ep in [p["endpoint"] for p in pool]:
                 return stored
-        # 새 프록시 할당 — 라운드 로빈 (시청자 순번 = 프록시 순번)
+        # 새 프록시 — 라운드 로빈
         idx = viewer_idx % len(pool) if viewer_idx >= 0 else 0
         chosen = pool[idx]
-        if failed_endpoint and chosen["endpoint"] == failed_endpoint:
-            chosen = pool[(idx + 1) % len(pool)]
         if viewer_idx >= 0:
             self._viewer_proxies[viewer_idx] = chosen
         return chosen
