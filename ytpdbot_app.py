@@ -3111,7 +3111,8 @@ class BotWorker:
                             except Exception:
                                 pass
                         self._update_db(real_count, "모니터링")
-                        time.sleep(delay)
+                        if not self._stop_event.wait(delay):
+                            break
         self._update_db(self._connected, "종료")
 
     def stop(self) -> None:
