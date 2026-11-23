@@ -2994,6 +2994,7 @@ class BotWorker:
         timestamp = now()
         bot_status = "실행" if status in ("가동 중", "모니터링") else status
         sess_status = "모니터링" if status in ("가동 중", "모니터링") else status
+        viewer_status = "가동 중" if status in ("가동 중", "모니터링") else status
         with connection() as conn:
             conn.execute(
                 "UPDATE active_bots SET connected_count=?, status=?, updated_at=? "
@@ -3018,7 +3019,7 @@ class BotWorker:
             # viewer_plans.current_count 갱신 (진짜 연결된 수)
             conn.execute(
                 "UPDATE viewer_plans SET current_count=?, status=?, updated_at=? WHERE id=?",
-                (connected, status, timestamp, self.bot_id),
+                (connected, viewer_status, timestamp, self.bot_id),
             )
 
     def run(self) -> None:
