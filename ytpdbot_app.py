@@ -2714,13 +2714,13 @@ class BotWorker:
             return None
         if self.proxy_name and not failed_endpoint:
             for p in pool:
-                if p["name"] == self.proxy_name:
+                if p["endpoint"] == self.proxy_name or p["name"] == self.proxy_name:
                     return p
         # 시청자별 고정 IP — 매번 같은 프록시 사용
         if viewer_idx >= 0 and viewer_idx in self._viewer_proxies:
             stored = self._viewer_proxies[viewer_idx]
-            # 저장된 프록시가 pool에 있고 실패한 프록시가 아니면 그대로 사용
-            if stored["endpoint"] not in [p["endpoint"] for p in pool]:
+            stored_ep = stored["endpoint"] if isinstance(stored, dict) else str(stored)
+            if stored_ep not in [p["endpoint"] for p in pool]:
                 pass  # pool에 없으면 새 프록시 할당
             elif stored["endpoint"] == failed_endpoint:
                 pass  # 실패한 프록시 → 새 프록시
