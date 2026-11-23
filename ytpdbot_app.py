@@ -2690,6 +2690,7 @@ class BotWorker:
         self._viewer_proxies = {}  # 시청자 인덱스 → 프록시 (고정 IP)
         self._proxy_cache = None
         self._proxy_cache_time = 0
+        self._last_chat_time = {}
 
     @property
     def running(self) -> bool:
@@ -2935,16 +2936,22 @@ class BotWorker:
         return ok, f"{self.platform} 접속 {'성공' if ok else '실패'}"
 
     def _send_chat(self) -> None:
+        import time as _t
         with connection() as conn:
             chats = conn.execute(
                 "SELECT * FROM auto_chats WHERE status='실행' AND bot_id=?",
                 (self.bot_id,),
             ).fetchall()
         for chat in chats:
+            # interval_seconds 준수
+            interval = chat["interval_seconds"] if chat["interval_seconds"] else 5
+            if _t.time() - self._last_chat_time.get(chat["id"], 0) < interval:
+                continue
+            self._last_chat_time[chat["id"]] = _t.time()
             msg = chat["message"]
             # 팬더티비: WebSocket으로 채팅 전송
             if self.platform == "팬더티비" and self._ws_list:
-                for ws in self._ws_list:  # 모든 WS로 전송
+                for ws in self._ws_list:
                     try:
                         ws.send(json.dumps({"cmd":"msg","userId":f"bot{random.randint(100000,999999)}","msg":msg}))
                     except Exception:
@@ -3031,7 +3038,7 @@ class BotWorker:
                 else:
                     # 프록시+직접 연결 모두 실패 → 0.5초 대기 후 재시도
                     self._stop_event.wait(0.5)
-            if "자동" in self.chat_mode and random.random() < 0.1:
+            if self.chat_mode != "채팅 시스템 비활성화" and "자동" in self.chat_mode:
                 self._send_chat()
             self._update_db(self._connected, "모니터링")
         # ② 유지 루프 — 55초마다 모든 WS 끊고 다시 연결
@@ -3114,7 +3121,12 @@ class BotWorker:
                         self._update_db(self._connected, "모니터링")
                         if not self._stop_event.wait(delay):
                             break
-        self._update_db(self._connected, "종료")
+        with connection() as conn:
+            cur = conn.execute("SELECT status FROM viewer_plans WHERE id=?", (self.bot_id,)).fetchone()
+            if cur and cur["status"] == "일시중지":
+                self._update_db(self._connected, "일시중지")
+            else:
+                self._update_db(self._connected, "종료")
 
     def stop(self) -> None:
         self._stop_event.set()
