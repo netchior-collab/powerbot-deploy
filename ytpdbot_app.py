@@ -2759,12 +2759,24 @@ class BotWorker:
         유튜브: https://www.youtube.com/live/dQw4w9WgXcQ -> dQw4w9WgXcQ
                  https://youtu.be/dQw4w9WgXcQ -> dQw4w9WgXcQ"""
         import re
+        from urllib.parse import urlsplit
         if "pandalive" in self.streamer_id:
             m = re.search(r"/(?:play|channel)/([^/?#]+)", self.streamer_id)
-            return m.group(1) if m else self.streamer_id
+            if m:
+                return m.group(1)
+            # fallback: URL 마지막 세그먼트 (https://pandalive.co.kr/20085495 -> 20085495)
+            path = urlsplit(self.streamer_id).path.strip("/")
+            if path:
+                return path
+            return self.streamer_id
         elif "flextv" in self.streamer_id:
             m = re.search(r"/channels/(\d+)", self.streamer_id)
-            return m.group(1) if m else self.streamer_id
+            if m:
+                return m.group(1)
+            path = urlsplit(self.streamer_id).path.strip("/")
+            if path:
+                return path.split("/")[0]
+            return self.streamer_id
         else:
             # /live/VIDEO_ID
             m = re.search(r"(?:/live/|youtu\.be/|v=)([A-Za-z0-9_-]+)", self.streamer_id)
@@ -2774,6 +2786,10 @@ class BotWorker:
             m = re.search(r"@([A-Za-z0-9_.-]+)", self.streamer_id)
             if m:
                 return m.group(1)
+            # fallback: URL 마지막 세그먼트
+            path = urlsplit(self.streamer_id).path.strip("/")
+            if path:
+                return path.split("/")[-1]
             return self.streamer_id
 
     def _download_hls(self, json_text, session=None, **kw) -> bool:
