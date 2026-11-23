@@ -3033,7 +3033,7 @@ class BotWorker:
                 else:
                     # 프록시+직접 연결 모두 실패 → 0.5초 대기 후 재시도
                     self._stop_event.wait(0.5)
-            if "채팅" in self.chat_mode and random.random() < 0.1:
+            if "자동" in self.chat_mode and random.random() < 0.1:
                 self._send_chat()
             self._update_db(self._connected, "모니터링")
         # ② 유지 루프 — 55초마다 모든 WS 끊고 다시 연결
