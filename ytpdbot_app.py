@@ -1240,7 +1240,7 @@ def collect_and_verify_proxies(
     def probe(endpoint: str) -> tuple[str, bool]:
         try:
             check_proxy_connection(endpoint, probe_timeout_seconds)
-        except (OSError, ValueError):
+        except (OSError, ValueError, requests.RequestException):
             return endpoint, False
         return endpoint, True
 
@@ -1889,7 +1889,7 @@ def _autostart_workers() -> None:
                     bid, row["platform"], row["streamer_id"],
                     int(row["viewer_count"] or 0),
                     "", bid,
-                    row.get("motion_type") or "", row.get("chat_mode") or "자연 채팅",
+                    row["motion_type"], row["chat_mode"],
                 )
     except Exception as e:
         print(f"[autostart] error: {e}")
@@ -2128,10 +2128,11 @@ def main() -> None:
                         stop_worker(plan["id"])
                         st.rerun()
                     if plan["status"] == "일시중지" and c1.button(
-                        "계획 다시 대기", key=f"resume_viewer_plan_{plan['id']}"
+                        "계획 재개", key=f"resume_viewer_plan_{plan['id']}"
                     ):
-                        set_viewer_plan_status(plan["id"], "대기")
-                        start_worker(plan["id"], plan["platform"], plan["streamer_id"], int(plan["viewer_count"]), "", plan["id"])
+                        set_viewer_plan_status(plan["id"], "가동 중")
+                        start_worker(plan["id"], plan["platform"], plan["streamer_id"], int(plan["viewer_count"]), "", plan["id"],
+                                     motion_type=plan["motion_type"], chat_mode=plan["chat_mode"])
                         st.rerun()
                     if plan["status"] != "종료" and c2.button(
                         "가동 계획 중지", key=f"stop_viewer_plan_{plan['id']}"
@@ -2685,6 +2686,8 @@ class BotWorker:
         self._connected = 0
         self._ws_list = []  # WebSocket 연결 목록
         self._viewer_proxies = {}  # 시청자 인덱스 → 프록시 (고정 IP)
+        self._proxy_cache = None
+        self._proxy_cache_time = 0
 
     @property
     def running(self) -> bool:
@@ -2774,21 +2777,24 @@ class BotWorker:
 
     def _extract_yt_stream(self, html) -> str:
         """유튜브: HTML → videoplayback(HLS) URL 추출"""
-        m = re.search(r'"streamingData":\{"formats":\[', html)
-        if not m:
-            m = re.search(r'"streamingData":\{', html)
-        if not m:
-            return ""
-        sd = m.group(0)
-        for pat in [
-            r'"formatId":"18","videoId":"[^"]*","url":"([^"]+)"',
-            r'"formatId":"18","url":"([^"]+)"',
-            r'"url":"https://manifest\.(?:m3u8|mpd)[^"]+"',
-            r'"url":"https://manifest\.[^"]+"',
-        ]:
-            m2 = re.search(pat, sd)
-            if m2:
-                return m2.group(1).replace("\\u0026", "&")
+        try:
+            m = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.*?\});', html, re.DOTALL)
+            if m:
+                import json
+                pr = json.loads(m.group(1))
+                sd = pr.get("streamingData", {})
+                hls = sd.get("hlsManifestUrl")
+                if hls:
+                    return hls.replace("\u0026", "&")
+                for fmt in (sd.get("formats", []) + sd.get("adaptiveFormats", [])):
+                    url = fmt.get("url", "")
+                    if "videoplayback" in url:
+                        return url.replace("\u0026", "&")
+        except Exception:
+            pass
+        m2 = re.search(r'"url":"(https://[^"]*videoplayback[^"]*)"', html)
+        if m2:
+            return m2.group(1).replace("\u0026", "&")
         return ""
 
     def _watch_api(self, proxy: dict | None) -> tuple[bool, int]:
@@ -2799,7 +2805,7 @@ class BotWorker:
         프록시 실패 시 직접 연결로 fallback"""
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/157.0.0.0 Safari/537.36"
 
-        if self.platform == "pandatv":
+        if self.platform == "팬더티비":
             cid = self._channel_id()
             body = f"userId={cid}&action=watch"
             url = "https://api.pandalive.co.kr/v1/live/play"
@@ -2813,7 +2819,7 @@ class BotWorker:
             method = "post"
             kwargs_extra = {"data": body}
             session = None
-        elif self.platform == "flextv":
+        elif self.platform == "플렉스티비":
             # HLS m3u8 → segment 다운로드 = 실제 시청자
             # player-count는 읽기 전용(+1 안 됨)
             cid = self._channel_id()
@@ -2855,7 +2861,7 @@ class BotWorker:
                     else:
                         resp = requests.get(url, headers=headers, timeout=8, **kwargs)
                 if resp.status_code == 200 and resp.text:
-                    if self.platform == "pandatv":
+                    if self.platform == "팬더티비":
                         d = resp.json()
                         cs = d.get("media", {}).get("chatServer", {})
                         jwt = d.get("token", "")
@@ -2871,7 +2877,7 @@ class BotWorker:
                             except Exception:
                                 pass
                         return True, real, cs.get("host", ""), cs.get("port", 0)
-                    elif self.platform == "flextv":
+                    elif self.platform == "플렉스티비":
                         # m3u8 → segment 다운로드 = 실제 시청자
                         seg_ok = self._download_hls(resp.text, session, **kwargs)
                         return seg_ok, (1 if seg_ok else 0), "", 0
@@ -2900,7 +2906,7 @@ class BotWorker:
                 else:
                     resp = requests.get(url, headers=headers, timeout=8)
             if resp.status_code == 200 and resp.text:
-                if self.platform == "pandatv":
+                if self.platform == "팬더티비":
                     d = resp.json()
                     cs = d.get("media", {}).get("chatServer", {})
                     jwt = d.get("token", "")
@@ -2916,7 +2922,7 @@ class BotWorker:
                         except Exception:
                             pass
                     return True, real, cs.get("host", ""), cs.get("port", 0)
-                elif self.platform == "flextv":
+                elif self.platform == "플렉스티비":
                     seg_ok = self._download_hls(resp.text, session)
                     return seg_ok, (1 if seg_ok else 0), "", 0
                 else:
@@ -2945,8 +2951,8 @@ class BotWorker:
         for chat in chats:
             msg = chat["message"]
             # 팬더티비: WebSocket으로 채팅 전송
-            if self.platform == "pandatv" and self._ws_list:
-                for ws in self._ws_list[:3]:  # 첫 3개 WS로 전송
+            if self.platform == "팬더티비" and self._ws_list:
+                for ws in self._ws_list:  # 모든 WS로 전송
                     try:
                         ws.send(json.dumps({"cmd":"msg","userId":f"bot{random.randint(100000,999999)}","msg":msg}))
                     except Exception:
@@ -3007,7 +3013,7 @@ class BotWorker:
             ok, real_count, chat_host, chat_port = self._watch_api(proxy)
             if ok:
                 self._connected += 1
-                if self.platform == "pandatv" and chat_host:
+                if self.platform == "팬더티비" and chat_host:
                     try:
                         ws = websocket.WebSocket()
                         ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
@@ -3022,7 +3028,7 @@ class BotWorker:
                 if ok:
                     self._connected += 1
                     self._update_db(real_count, "모니터링")
-                    if self.platform == "pandatv" and chat_host:
+                    if self.platform == "팬더티비" and chat_host:
                         try:
                             ws = websocket.WebSocket()
                             ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
@@ -3062,7 +3068,7 @@ class BotWorker:
                     ok, real_count, chat_host, chat_port = self._watch_api(proxy)
                 if ok:
                     self._connected += 1
-                    if self.platform == "pandatv" and chat_host:
+                    if self.platform == "팬더티비" and chat_host:
                         for _retry in range(3):
                             try:
                                 ws = websocket.WebSocket()
@@ -3105,7 +3111,7 @@ class BotWorker:
                         ok, real_count, chat_host, chat_port = self._watch_api(proxy)
                     if ok:
                         self._connected += 1
-                        if self.platform == "pandatv" and chat_host:
+                        if self.platform == "팬더티비" and chat_host:
                             try:
                                 ws = websocket.WebSocket()
                                 ws.connect(f"wss://{chat_host}:{chat_port}", timeout=5)
@@ -3136,7 +3142,7 @@ def start_worker(bot_id: str, platform: str, streamer_id: str,
                  target_count: int, proxy_name: str = "", session_id: str = "",
                  motion_type: str = "자연스럽게 서서히 증가/감소 (추천)",
                  chat_mode: str = "연동된 계정으로 자동 매크로 채팅 분") -> BotWorker:
-    worker = BotWorker(bot_id, platform, streamer_id, target_count, proxy_name, session_id)
+    worker = BotWorker(bot_id, platform, streamer_id, target_count, proxy_name, plan_id=bot_id, session_id=session_id)
     worker.motion_type = motion_type
     worker.chat_mode = chat_mode
     _ACTIVE_WORKERS[bot_id] = worker
