@@ -2976,25 +2976,27 @@ class BotWorker:
 
     def _update_db(self, connected: int, status: str) -> None:
         timestamp = now()
+        bot_status = "실행" if status in ("가동 중", "모니터링") else status
+        sess_status = "모니터링" if status in ("가동 중", "모니터링") else status
         with connection() as conn:
             conn.execute(
                 "UPDATE active_bots SET connected_count=?, status=?, updated_at=? "
                 "WHERE id=?",
-                (connected, status, timestamp, self.bot_id),
+                (connected, bot_status, timestamp, self.bot_id),
             )
             if not self.session_id:
                 self.session_id = self.bot_id
             cur = conn.execute(
                 "UPDATE broadcast_sessions "
                 "SET observed_viewers=?, status=?, updated_at=? WHERE id=?",
-                (connected, status, timestamp, self.session_id),
+                (connected, sess_status, timestamp, self.session_id),
             )
             if cur.rowcount == 0:
                 conn.execute(
                     "INSERT OR IGNORE INTO broadcast_sessions "
                     "(id, platform, streamer_id, status, observed_viewers, "
                     "started_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                    (self.session_id, self.platform, self.streamer_id, status,
+                    (self.session_id, self.platform, self.streamer_id, sess_status,
                      connected, timestamp, timestamp),
                 )
             # viewer_plans.current_count도 갱신 (진짜 연결된 수)
