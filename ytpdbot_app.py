@@ -2809,6 +2809,38 @@ class BotWorker:
             return m2.group(1).replace("\u0026", "&")
         return ""
 
+    def _watch_result(self, text: str, session, kwargs) -> tuple[bool, int, str, int]:
+        """응답 텍스트 → 플랫폼별 실제 시청자 처리 (프록시/직접 공용)"""
+        if self.platform == "팬더티비":
+            d = resp_json = json.loads(text)
+            cs = d.get("media", {}).get("chatServer", {})
+            jwt = d.get("token", "")
+            real = d.get("media", {}).get("user", 0)
+            if jwt:
+                try:
+                    cu = requests.get(
+                        "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
+                        params={"channel": d.get("channel", ""), "token": jwt},
+                        timeout=5,
+                        **({"proxies": kwargs} if kwargs else {}),
+                    )
+                    real = cu.json().get("count", real)
+                except Exception:
+                    pass
+            return True, real, cs.get("host", ""), cs.get("port", 0)
+        elif self.platform == "플렉스티비":
+            seg_ok = self._download_hls(text, session, **kwargs)
+            return seg_ok, (1 if seg_ok else 0), "", 0
+        else:
+            seg_url = self._extract_yt_stream(text)
+            if seg_url:
+                try:
+                    (session or requests).get(seg_url, timeout=8, **kwargs)
+                    return True, 1, "", 0
+                except Exception:
+                    pass
+            return False, 0, "", 0
+
     def _watch_api(self, proxy: dict | None) -> tuple[bool, int]:
         """플랫폼별 실제 API 호출 — 시청자 1명 접속
         팬더티비: POST watch (30분 토큰)
@@ -2873,38 +2905,13 @@ class BotWorker:
                     else:
                         resp = requests.get(url, headers=headers, timeout=8, **kwargs)
                 if resp.status_code == 200 and resp.text:
-                    if self.platform == "팬더티비":
-                        d = resp.json()
-                        cs = d.get("media", {}).get("chatServer", {})
-                        jwt = d.get("token", "")
-                        real = d.get("media", {}).get("user", 0)
-                        if jwt:
-                            try:
-                                cu = requests.get(
-                                    "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
-                                    params={"channel": d.get("channel", ""), "token": jwt},
-                                    timeout=5, proxies=kwargs,
-                                )
-                                real = cu.json().get("count", real)
-                            except Exception:
-                                pass
-                        return True, real, cs.get("host", ""), cs.get("port", 0)
-                    elif self.platform == "플렉스티비":
-                        # m3u8 → segment 다운로드 = 실제 시청자
-                        seg_ok = self._download_hls(resp.text, session, **kwargs)
-                        return seg_ok, (1 if seg_ok else 0), "", 0
-                    else:
-                        # videoplayback segment = 실제 시청자
-                        seg_url = self._extract_yt_stream(resp.text)
-                        if seg_url:
-                            try:
-                                (session or requests).get(seg_url, timeout=8, **kwargs)
-                                return True, 1, "", 0
-                            except Exception:
-                                pass
-                        return False, 0, "", 0
+                    return self._watch_result(resp.text, session, kwargs)
             except Exception:
-                pass
+                # 프록시 실패 → quarantine (같은 죽은 프록시 반복 방지)
+                try:
+                    _discard_failed_proxy(proxy.get("name", ""), pause_dependents=False)
+                except Exception:
+                    pass
         # 2) 직접 연결 fallback
         try:
             if method == "post":
@@ -2918,34 +2925,7 @@ class BotWorker:
                 else:
                     resp = requests.get(url, headers=headers, timeout=8)
             if resp.status_code == 200 and resp.text:
-                if self.platform == "팬더티비":
-                    d = resp.json()
-                    cs = d.get("media", {}).get("chatServer", {})
-                    jwt = d.get("token", "")
-                    real = d.get("media", {}).get("user", 0)
-                    if jwt:
-                        try:
-                            cu = requests.get(
-                                "https://cache-api.pandalive.co.kr/v1/chat/channel_user_count",
-                                params={"channel": d.get("channel", ""), "token": jwt},
-                                timeout=5,
-                            )
-                            real = cu.json().get("count", real)
-                        except Exception:
-                            pass
-                    return True, real, cs.get("host", ""), cs.get("port", 0)
-                elif self.platform == "플렉스티비":
-                    seg_ok = self._download_hls(resp.text, session)
-                    return seg_ok, (1 if seg_ok else 0), "", 0
-                else:
-                    seg_url = self._extract_yt_stream(resp.text)
-                    if seg_url:
-                        try:
-                            requests.get(seg_url, timeout=8)
-                            return True, 1, "", 0
-                        except Exception:
-                            pass
-                    return False, 0, "", 0
+                return self._watch_result(resp.text, session, None)
         except Exception:
             pass
         return False, 0, "", 0
