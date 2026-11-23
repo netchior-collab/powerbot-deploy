@@ -3112,7 +3112,7 @@ class BotWorker:
                         continue
             # 25분마다 일부 이탈 후 재접속
             if tick % 27 == 0:
-                drop = random.randint(1, max(2, self.target_count // 10))
+                drop = min(random.randint(1, max(1, self.target_count // 10)), self._connected)
                 for _ in range(drop):
                     if self._stop_event.is_set():
                         break
